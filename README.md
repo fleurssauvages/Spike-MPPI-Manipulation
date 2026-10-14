@@ -30,6 +30,25 @@ Detailed code and install for a locomotion task and Ant robot is available at: h
        alt="Standard MPPI reaching">
 </p>
 
+## Results on 100 runs
+
+<h3 align="center">Normalized Reaching Progress</h3>
+
+<p align="center">
+  <img src="manipulation/results/reaching_normalized_distance.png"
+       width="450"
+       alt="Normalized reaching progress">
+</p>
+
+<h3 align="center">Performances</h3>
+
+<p align="center">
+  <img src="manipulation/results/reaching_violins.png"
+       width="900"
+       alt="Performances">
+</p>
+
+
 ## Install
 
 Requires Python 3.10+, MuJoCo 3.3+, and a C++17 compiler for the optional native rollout extension.
