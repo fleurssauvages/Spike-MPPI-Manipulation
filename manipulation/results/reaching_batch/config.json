@@ -30,7 +30,7 @@
   "reach_velocity_sigma": 0.05,
   "reach_velocity_weight": 0.2,
   "repeats": 100,
-  "resume": false,
+  "resume": true,
   "rollout_workers": 8,
   "rollouts": 32,
   "sampling": "standard",
