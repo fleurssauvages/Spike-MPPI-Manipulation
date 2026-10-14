@@ -1,7 +1,0 @@
-numpy
-numba
-mujoco>=3.3
-pybind11>=2.12
-setuptools
-imageio>=2.31
-Pillow>=10

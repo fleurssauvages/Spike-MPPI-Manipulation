@@ -11,7 +11,7 @@ Detailed code and install for a locomotion task and Ant robot is available at: h
 ## Demo
 
 <p align="center">
-  <strong>Spike-MPPI</strong>
+  <strong>Spike-MPPI (32 rollouts)</strong>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@ Detailed code and install for a locomotion task and Ant robot is available at: h
 </p>
 
 <p align="center">
-  <strong>Standard MPPI</strong>
+  <strong>Standard MPPI (32 rollouts)</strong>
 </p>
 
 <p align="center">
