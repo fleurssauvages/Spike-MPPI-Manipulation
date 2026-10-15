@@ -46,6 +46,9 @@ def build_controller(
     horizon: int = 20,
     num_rollouts: int = 32,
     control_dt: float = 0.01,
+    twitch_rise_s: float = 0.016,
+    twitch_decay_s: float = 0.064,
+    twitch_duration_s: float = 0.200,
     joint_noise_fraction: float = 0.15,
     noise_space: str = 'effector',
     effector_noise_std: float = 0.01,
@@ -71,6 +74,9 @@ def build_controller(
     """MPPI objective for the free-space 3-D reaching benchmark."""
     cfg = ControllerConfig(
         control_dt=float(control_dt),
+        twitch_rise_s=float(twitch_rise_s),
+        twitch_decay_s=float(twitch_decay_s),
+        twitch_duration_s=float(twitch_duration_s),
         horizon=int(horizon),
         num_rollouts=int(num_rollouts),
         joint_noise_fraction=float(joint_noise_fraction),
@@ -226,6 +232,9 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         horizon=args.horizon,
         num_rollouts=args.rollouts,
         control_dt=args.control_dt,
+        twitch_rise_s=args.twitch_rise_s,
+        twitch_decay_s=args.twitch_decay_s,
+        twitch_duration_s=args.twitch_duration_s,
         joint_noise_fraction=args.joint_noise,
         noise_space=args.noise_space,
         effector_noise_std=args.effector_noise_std,
@@ -292,6 +301,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
     act_hist = [initial.act.copy()]
     state_time_hist = [float(initial.time)]
     controls_hist: list[np.ndarray] = []
+    controller_times_ms: list[float] = []
     target_index_hist = [int(sequence_ids[active_sequence_index])]
     capture_analysis = bool(getattr(args, "analysis_trace", False))
     if capture_analysis:
@@ -342,6 +352,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
             after = robot.snapshot()
             applied_step = float(np.linalg.norm(after.ctrl - prev_ctrl))
             last_info = info
+            controller_times_ms.append(float(info.get("timing_ms", {}).get("total", float("nan"))))
 
             sim_dt = max(0.0, float(after.time) - previous_sim_time)
             previous_sim_time = float(after.time)
@@ -497,22 +508,16 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
             additional=extra,
         )
         saved_path = str(saved)
-        if not bool(getattr(args, "batch_mode", False)):
-            print(f"saved replay: {saved}")
-            print(f"replay with: python -m manipulation.experiments.replay --file {saved}")
-            print(
-                "GIF with:    python -m manipulation.experiments.replay "
-                f"--file {saved} --gif manipulation/results/last_run.gif"
-            )
 
     return {
         "seed": int(args.seed),
         "mean_weighted_cost": float(np.nanmean(diagnostics["weighted_rollout_cost"])) if capture_analysis and diagnostics["weighted_rollout_cost"] and np.isfinite(diagnostics["weighted_rollout_cost"]).any() else float("nan"),
-        "mean_compute_ms": float(np.nanmean(diagnostics["timing_total_ms"])) if capture_analysis and diagnostics["timing_total_ms"] else float("nan"),
+        "mean_compute_ms": float(np.mean(np.asarray(controller_times_ms)[np.isfinite(controller_times_ms)])) if np.isfinite(controller_times_ms).any() else float("nan"),
         "mean_control_increment_l2": float(np.mean(np.linalg.norm(np.diff(np.asarray(controls_hist), axis=0), axis=1))) if len(controls_hist) > 1 else float("nan"),
         "mean_tip_speed_mps": float(np.mean(np.linalg.norm(np.asarray(tip_vel_hist), axis=1))) if capture_analysis else float("nan"),
         "completed": bool(completed),
         "steps": step + 1,
+        "simulation_time_s": float(state_time_hist[-1] - state_time_hist[0]),
         "targets_validated": int(validated_targets),
         "targets_requested": int(len(sequence_ids)),
         "cycles_requested": int(args.cycles),
@@ -543,6 +548,9 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--horizon", type=int, default=20)
     p.add_argument("--rollouts", type=int, default=32)
     p.add_argument("--control-dt", type=float, default=0.01)
+    p.add_argument("--twitch-rise-s", type=float, default=0.016)
+    p.add_argument("--twitch-decay-s", type=float, default=0.064)
+    p.add_argument("--twitch-duration-s", type=float, default=0.200)
     p.add_argument("--joint-noise", type=float, default=0.15)
     p.add_argument("--noise-space", choices=["joint", "effector"], default="effector",
                    help="Interpret MPPI proposals in joint or Cartesian XYZ tip space")
@@ -554,10 +562,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--noise-decay-order", type=float, default=1.0,
                    help="Positive exponent n in min(1, (distance / dslow)**n); 1 is linear")
     p.add_argument("--reach-terminal-weight", type=float, default=2.0)
-    p.add_argument("--reach-velocity-weight", type=float, default=0.2)
+    p.add_argument("--reach-velocity-weight", type=float, default=0.0)
     p.add_argument("--reach-region-weight", type=float, default=0.0)
     p.add_argument("--reach-settle-weight", type=float, default=0.0)
-    p.add_argument("--reach-acceleration-weight", type=float, default=0.01)
+    p.add_argument("--reach-acceleration-weight", type=float, default=0.00)
     p.add_argument("--reach-safe-radius", type=float, default=0.015)
     p.add_argument("--reach-velocity-ref", type=float, default=0.1)
     p.add_argument("--reach-velocity-sigma", type=float, default=0.05)
@@ -599,7 +607,18 @@ def make_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = make_parser().parse_args()
     result = run(args)
-    print("franka_reach " + " ".join(f"{k}={v}" for k, v in result.items()))
+    recording = str(result.get("recording", ""))
+    if recording:
+        video = str(Path(recording).with_suffix(".mp4"))
+        print(f"Replay: python -m manipulation.experiments.replay --file {recording}")
+        print(f"MP4:    python -m manipulation.experiments.replay --file {recording} --mp4 {video}")
+    else:
+        print("Replay/MP4: not available (--no-save)")
+
+    sim_time_s = float(result["simulation_time_s"])
+    print(f"Time:             {sim_time_s:.2f} s ({'completed' if result['completed'] else 'incomplete'})")
+    print(f"Control smoothness: {float(result['mean_control_increment_l2']):.5f} rad/step")
+    print(f"Computation time:   {float(result['mean_compute_ms']):.3f} ms/update")
 
 
 if __name__ == "__main__":
