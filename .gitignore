@@ -3,6 +3,8 @@
 .pyc*
 manipulation/results/horizon_20
 /build
+manipulation/mppi/__pycache__
+manipulation/franka_reaching/__pycache__
 manipulation/results/reaching_batch/
 manipulation/results/reaching_batch_poisson/
 manipulation/results/reaching_batch_spike/
