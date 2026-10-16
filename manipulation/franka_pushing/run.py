@@ -299,10 +299,8 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         for step in range(int(args.steps)):
             was_repositioning = reposition is not None
             if was_repositioning:
-                # Identical deterministic transfer for every sampling method;
-                # no MPPI optimization is performed during the transfer.
-                action = reposition.action(robot, float(args.control_dt))
-                info = {}
+                # MPPI reaching uses the same sampling method as pushing.
+                action, info = reposition.action(robot, controller, float(args.control_dt))
                 reposition_steps += 1
             else:
                 action, info = controller.step(robot.data, 0.0)
@@ -318,7 +316,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
                 elif reposition.finished:
                     if args.verbose:
                         print(f"reposition completed after {reposition.elapsed:.2f}s; "
-                              "resuming pushing MPPI")
+                              "resuming fused pushing MPPI")
                     reposition = None
                     controller.reset_warm_start()
             after = robot.snapshot()
@@ -359,7 +357,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
                         )
                         reposition_count += 1
                         if args.verbose:
-                            print(f"repositioning fingertip before pushing toward "
+                            print(f"MPPI reaching to the opposite side before pushing toward "
                                   f"{points[route.goal_index].tolist()}")
             # Record the goal active at each stored state (the NEW one on an
             # arrival frame, since the next controller update sees this goal).
@@ -532,18 +530,18 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--lbps-delta", type=float, default=0.95)
     p.add_argument("--goal-tolerance", type=float, default=0.025)
     p.add_argument("--hold-seconds", type=float, default=1.0)
-    # Includes the deterministic transition around a 32 cm box after reversals.
+    # Includes MPPI reaching transfer around the box after reversals.
     p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--reposition-on-switch", dest="reposition_on_switch", action="store_true", default=True,
-                   help="Lift/cross/lower the tip to the new pushing side after each backforth goal change")
+                   help="Use collision-aware MPPI reaching via clearance targets after reversing")
     p.add_argument("--no-reposition", dest="reposition_on_switch", action="store_false",
-                   help="Original pure-MPPI reversal, without deterministic transition")
+                   help="Original pure-MPPI reversal, without MPPI reaching transfer")
     p.add_argument("--reposition-clearance", type=float, default=0.12,
                    help="Tip height clearance above the box top during the crossing (m)")
     p.add_argument("--reposition-standoff", type=float, default=0.045,
                    help="Distance beyond the opposite box side face (m)")
     p.add_argument("--reposition-timeout", type=float, default=9.0,
-                   help="Abort rather than push from the wrong side if a transfer cannot finish (s)")
+                   help="Abort if MPPI reaching fails to reach the opposite side (s)")
     p.add_argument("--viewer", dest="viewer", action="store_true", default=True)
     p.add_argument("--no-viewer", dest="viewer", action="store_false")
     p.add_argument("--viewer-ui", action="store_true")
