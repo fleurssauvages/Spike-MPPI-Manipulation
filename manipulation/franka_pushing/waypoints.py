@@ -8,6 +8,7 @@ import numpy as np
 
 DEFAULT_START_XY = (0.40, 0.0)
 DEFAULT_GOAL_XY = (0.40, 0.18)
+DEFAULT_DEPTH_X = 0.18
 
 
 def square_corners(start_xy, second_xy) -> np.ndarray:
@@ -25,21 +26,33 @@ def square_corners(start_xy, second_xy) -> np.ndarray:
     return np.stack((a, b, b + right, a + right))
 
 
-def resolve_waypoints(*, start_xy, goal_xy, route: str, waypoints=None) -> np.ndarray:
+def resolve_waypoints(*, start_xy, goal_xy, route: str, waypoints=None, depth: float = DEFAULT_DEPTH_X) -> np.ndarray:
     """Resolve the CLI geometry and validate adjacent goal separation."""
-    if route not in ("backforth", "square", "pingpong", "point"):
-        raise ValueError("route must be backforth, square, pingpong, or point")
+    if route not in ("triangle", "backforth", "square", "pingpong", "point"):
+        raise ValueError("route must be triangle, backforth, square, pingpong, or point")
     if waypoints is not None:
         if route == "point":
             raise ValueError("--waypoints is not valid for the one-way point route")
         xy = np.asarray(waypoints, dtype=np.float64)
-        if xy.size != 8:
-            raise ValueError("--waypoints requires four XY pairs (8 numbers)")
-        xy = xy.reshape(4, 2)
+        expected = 6 if route == "triangle" else 8
+        if xy.size != expected:
+            raise ValueError(f"--waypoints requires {expected // 2} XY pairs ({expected} numbers)")
+        xy = xy.reshape(-1, 2)
         if route == "backforth":
-            xy = xy[:2]  # Ignore C and D if four waypoints were supplied.
+            xy = xy[:2]
     elif route in ("point", "backforth"):
         xy = np.asarray([start_xy, goal_xy], dtype=np.float64).reshape(2, 2)
+    elif route == "triangle":
+        a = np.asarray(start_xy, dtype=np.float64).reshape(2)
+        b = np.asarray(goal_xy, dtype=np.float64).reshape(2)
+        if not np.isfinite(depth) or depth <= 0:
+            raise ValueError("triangle depth must be finite and positive")
+        normal = np.array([b[1] - a[1], -(b[0] - a[0])], dtype=np.float64)
+        span = np.linalg.norm(normal)
+        if span < 1e-6:
+            raise ValueError("triangle's first two points must differ")
+        c = 0.5 * (a + b) + depth * normal / span
+        xy = np.stack((a, b, c))
     else:
         xy = square_corners(start_xy, goal_xy)
     if not np.all(np.isfinite(xy)):
@@ -61,8 +74,8 @@ class WaypointRoute:
     A->B->C->D->C->B->A. No target changes happen within an MPPI rollout.
     """
 
-    mode: str = "backforth"
-    cycles: int = 4
+    mode: str = "triangle"
+    cycles: int = 2
     active_segment: int = 0
     segments_completed: int = 0
     cycles_completed: int = 0
@@ -70,7 +83,9 @@ class WaypointRoute:
     done: bool = False
 
     def __post_init__(self):
-        if self.mode == "backforth":
+        if self.mode == "triangle":
+            self._sequence = (1, 2, 0)
+        elif self.mode == "backforth":
             self._sequence = (1, 0)
         elif self.mode == "square":
             self._sequence = (1, 2, 3, 0)
@@ -118,4 +133,4 @@ class WaypointRoute:
         return arrived
 
 
-__all__ = ["DEFAULT_START_XY", "DEFAULT_GOAL_XY", "square_corners", "resolve_waypoints", "WaypointRoute"]
+__all__ = ["DEFAULT_START_XY", "DEFAULT_GOAL_XY", "DEFAULT_DEPTH_X", "square_corners", "resolve_waypoints", "WaypointRoute"]

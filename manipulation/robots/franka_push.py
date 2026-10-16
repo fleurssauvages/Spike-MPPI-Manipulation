@@ -107,10 +107,10 @@ class FrankaPushRobot(FrankaReachRobot):
             self.mujoco.mj_forward(self.model, self.data)
 
     def set_waypoints_xy(self, points) -> None:
-        """Display and validate the four tabletop corners (does not move the box)."""
+        """Display and validate three or four tabletop waypoints."""
         xy = np.asarray(points, dtype=np.float64)
-        if xy.shape != (4, 2) or not np.all(np.isfinite(xy)):
-            raise ValueError("waypoints must contain exactly four finite XY points")
+        if xy.shape not in ((3, 2), (4, 2)) or not np.all(np.isfinite(xy)):
+            raise ValueError("waypoints must contain three or four finite XY points")
         if not np.allclose(xy[0], self._start_xy, atol=1e-9, rtol=0.0):
             raise ValueError("first waypoint must equal the physical box's start XY")
         for i, point in enumerate(xy):
@@ -118,7 +118,11 @@ class FrankaPushRobot(FrankaReachRobot):
         if any(sid < 0 for sid in self._waypoint_site_ids):
             raise ValueError("pushing scene requires push_waypoint_1/2/3 sites")
         for i, sid in enumerate(self._waypoint_site_ids, start=1):
-            self.model.site_pos[sid] = [xy[i, 0], xy[i, 1], self._box_rest_z]
+            if i < len(xy):
+                self.model.site_pos[sid] = [xy[i, 0], xy[i, 1], self._box_rest_z]
+                self.model.site_rgba[sid, 3] = 0.45
+            else:
+                self.model.site_rgba[sid, 3] = 0.0
         self._waypoints_xy = xy.copy()
         self.mujoco.mj_forward(self.model, self.data)
 

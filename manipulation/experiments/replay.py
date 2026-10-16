@@ -66,7 +66,7 @@ def _prepare_replay(path: str | Path, *, auto_fetch: bool = True):
         robot = FrankaPushRobot(auto_fetch=auto_fetch, start_xy=start[:2], goal_xy=goal[:2])
         if "waypoints_xy" in record:
             xy = np.asarray(record["waypoints_xy"], dtype=np.float64)
-            if xy.shape == (4, 2):
+            if xy.shape in ((3, 2), (4, 2)):
                 robot.set_waypoints_xy(xy)
             elif xy.shape == (2, 2):
                 robot.hide_waypoints()

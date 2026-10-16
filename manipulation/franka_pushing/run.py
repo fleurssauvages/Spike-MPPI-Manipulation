@@ -16,9 +16,8 @@ from manipulation.tracks import StraightTrack
 
 from .waypoints import (
     DEFAULT_START_XY as START_XY, DEFAULT_GOAL_XY as GOAL_XY,
-    WaypointRoute, resolve_waypoints,
+    WaypointRoute, resolve_waypoints, DEFAULT_DEPTH_X,
 )
-from .reposition import PushReposition
 
 
 def build_controller(
@@ -168,8 +167,6 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         raise ValueError("steps, goal-tolerance and hold-seconds must be positive")
     if args.cycles < 0:
         raise ValueError("--cycles must be nonnegative (0 repeats until --steps)")
-    if args.reposition_clearance <= 0 or args.reposition_standoff <= 0 or args.reposition_timeout <= 0:
-        raise ValueError("reposition clearance/standoff/timeout must be positive")
     for name in ("tip_box_weight", "box_goal_weight", "control_deviation_weight"):
         value = float(getattr(args, name))
         if not np.isfinite(value) or value < 0:
@@ -177,7 +174,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
 
     points = resolve_waypoints(
         start_xy=args.start_xy, goal_xy=args.goal_xy,
-        route=args.route, waypoints=args.waypoints,
+        route=args.route, waypoints=args.waypoints, depth=args.triangle_depth,
     )
     route = WaypointRoute(mode=args.route, cycles=args.cycles)
     robot = FrankaPushRobot(
@@ -186,7 +183,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         auto_fetch=not args.no_auto_fetch,
         motion_limit_scale=args.motion_limit_scale,
     )
-    if len(points) == 4:
+    if len(points) in (3, 4):
         robot.set_waypoints_xy(points)
     else:
         robot.hide_waypoints()
@@ -276,11 +273,6 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
     closest_error = initial_error
     completed = False
     last_info: dict = {}
-    reposition: PushReposition | None = None
-    reposition_count = 0
-    reposition_steps = 0
-    reposition_failed = False
-    phase_hist = ["push"]
     step = -1
     t_wall = time.perf_counter()
     last_time = float(initial.time)
@@ -297,29 +289,10 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
             print(f"sampling={args.sampling} noise-space={args.noise_space} "
                   f"covariance=fixed (no near-goal decay); backend={backend}")
         for step in range(int(args.steps)):
-            was_repositioning = reposition is not None
-            if was_repositioning:
-                # MPPI reaching uses the same sampling method as pushing.
-                action, info = reposition.action(robot, controller, float(args.control_dt))
-                reposition_steps += 1
-            else:
-                action, info = controller.step(robot.data, 0.0)
-                last_info = info
+            action, info = controller.step(robot.data, 0.0)
             robot.step_control(action, substeps=controller.control_substeps)
-            if was_repositioning:
-                reposition.observe(robot, float(args.control_dt))
-                if reposition.failed:
-                    reposition_failed = True
-                    if args.verbose:
-                        print(f"reposition timed out after {reposition.elapsed:.2f}s "
-                              f"in phase {reposition.stage}")
-                elif reposition.finished:
-                    if args.verbose:
-                        print(f"reposition completed after {reposition.elapsed:.2f}s; "
-                              "resuming fused pushing MPPI")
-                    reposition = None
-                    controller.reset_warm_start()
             after = robot.snapshot()
+            last_info = info
             controller_times.append(float(info.get("timing_ms", {}).get("total", np.nan)))
             dt = max(0.0, float(after.time) - last_time)
             last_time = float(after.time)
@@ -328,17 +301,14 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
             act_hist.append(after.act.copy())
             time_hist.append(float(after.time))
             controls_hist.append(after.ctrl.copy())
-            phase_hist.append("reposition" if was_repositioning else "push")
 
             box_error = robot.box_goal_distance()  # Error to goal used for this step.
             tip_error = robot.tip_box_surface_distance()
             closest_error = min(closest_error, box_error)
-            arrived = None
-            if not was_repositioning:
-                arrived = route.observe(
-                    distance=box_error, dt=dt,
-                    tolerance=args.goal_tolerance, hold_seconds=args.hold_seconds,
-                )
+            arrived = route.observe(
+                distance=box_error, dt=dt,
+                tolerance=args.goal_tolerance, hold_seconds=args.hold_seconds,
+            )
             if arrived is not None:
                 arrival_steps.append(step + 1)
                 arrival_times.append(float(after.time))
@@ -348,17 +318,6 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
                           f"cycles completed={route.cycles_completed}")
                 if not route.done:
                     _retarget_goal(robot, controller, points[route.goal_index], viewer)
-                    if args.reposition_on_switch and route.mode == "backforth":
-                        reposition = PushReposition(
-                            goal_xy=tuple(points[route.goal_index]),
-                            clearance=float(args.reposition_clearance),
-                            standoff=float(args.reposition_standoff),
-                            max_seconds=float(args.reposition_timeout),
-                        )
-                        reposition_count += 1
-                        if args.verbose:
-                            print(f"MPPI reaching to the opposite side before pushing toward "
-                                  f"{points[route.goal_index].tolist()}")
             # Record the goal active at each stored state (the NEW one on an
             # arrival frame, since the next controller update sees this goal).
             goal_hist.append(robot.goal_xyz())
@@ -392,8 +351,6 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
                 print(f"step={step+1} goal={route.goal_index} "
                       f"box-goal={robot.box_goal_distance():.4f}m "
                       f"tip-box={tip_error:.4f}m; cycles={route.cycles_completed}")
-            if reposition_failed:
-                break
             if route.done:
                 completed = True
                 if args.verbose:
@@ -429,7 +386,6 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
                 "box_goal_weight": np.asarray(float(args.box_goal_weight)),
                 "control_deviation_weight": np.asarray(float(args.control_deviation_weight)),
                 "adaptive_noise": np.asarray(False),
-                "reposition_on_switch": np.asarray(bool(args.reposition_on_switch)),
             })
         np.savez_compressed(
             path,
@@ -457,7 +413,6 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
             act=np.asarray(act_hist, dtype=np.float64),
             state_time=np.asarray(time_hist, dtype=np.float64),
             controls=np.asarray(controls_hist, dtype=np.float64).reshape((-1, robot.nu)),
-            control_phase=np.asarray(phase_hist, dtype="U12"),
         )
         dest = str(path)
 
@@ -480,9 +435,6 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         "mean_control_increment_l2": float(np.linalg.norm(np.diff(ctrl, axis=0), axis=1).mean())
             if len(ctrl) > 1 else float("nan"),
         "wall_time_s": float(elapsed),
-        "reposition_transfers": int(reposition_count),
-        "reposition_control_steps": int(reposition_steps),
-        "reposition_failed": bool(reposition_failed),
         "sampling": args.sampling,
         "noise_space": args.noise_space,
         "effector_noise_std_m": float(args.effector_noise_std),
@@ -516,32 +468,23 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--start-xy", type=float, nargs=2, metavar=("X", "Y"), default=START_XY)
     p.add_argument("--goal-xy", type=float, nargs=2, metavar=("X", "Y"), default=GOAL_XY,
                    help="second corner; start->goal specifies the first square side")
-    p.add_argument("--route", choices=["backforth", "square", "pingpong", "point"], default="backforth",
-                   help="backforth: A-B-A (default); square: A-B-C-D-A; "
+    p.add_argument("--route", choices=["triangle", "backforth", "square", "pingpong", "point"], default="triangle",
+                   help="triangle: A-B-C-A (default); backforth: A-B-A; square: A-B-C-D-A; "
                         "pingpong: A-B-C-D-C-B-A; point: one-way A-B")
-    p.add_argument("--waypoints", type=float, nargs=8,
-                   metavar=("AX", "AY", "BX", "BY", "CX", "CY", "DX", "DY"),
-                   help="override XY waypoints; backforth uses only A and B of the four pairs")
-    p.add_argument("--cycles", type=int, default=4,
-                   help="number of complete routes (backforth: A-B-A); 0 repeats until --steps")
+    p.add_argument("--waypoints", type=float, nargs="+",
+                   metavar="XY",
+                   help="triangle needs 6 numbers (A,B,C); square/pingpong/backforth need 8")
+    p.add_argument("--triangle-depth", type=float, default=DEFAULT_DEPTH_X,
+                   help="third triangle waypoint depth, perpendicular to A->B (m)")
+    p.add_argument("--cycles", type=int, default=1,
+                   help="number of complete routes (triangle: A-B-C-A); 0 repeats until --steps")
     p.add_argument("--tip-box-weight", type=float, default=0.1)
     p.add_argument("--box-goal-weight", type=float, default=10.0)
     p.add_argument("--control-deviation-weight", type=float, default=0.0)
     p.add_argument("--lbps-delta", type=float, default=0.95)
     p.add_argument("--goal-tolerance", type=float, default=0.025)
     p.add_argument("--hold-seconds", type=float, default=1.0)
-    # Includes MPPI reaching transfer around the box after reversals.
-    p.add_argument("--steps", type=int, default=8000)
-    p.add_argument("--reposition-on-switch", dest="reposition_on_switch", action="store_true", default=True,
-                   help="Use collision-aware MPPI reaching via clearance targets after reversing")
-    p.add_argument("--no-reposition", dest="reposition_on_switch", action="store_false",
-                   help="Original pure-MPPI reversal, without MPPI reaching transfer")
-    p.add_argument("--reposition-clearance", type=float, default=0.12,
-                   help="Tip height clearance above the box top during the crossing (m)")
-    p.add_argument("--reposition-standoff", type=float, default=0.045,
-                   help="Distance beyond the opposite box side face (m)")
-    p.add_argument("--reposition-timeout", type=float, default=9.0,
-                   help="Abort if MPPI reaching fails to reach the opposite side (s)")
+    p.add_argument("--steps", type=int, default=4000)
     p.add_argument("--viewer", dest="viewer", action="store_true", default=True)
     p.add_argument("--no-viewer", dest="viewer", action="store_false")
     p.add_argument("--viewer-ui", action="store_true")
