@@ -32,3 +32,4 @@ build/
 *.egg-info/
 
 /results
+manipulation/results/pushing_last_run.npz

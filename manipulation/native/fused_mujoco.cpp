@@ -524,7 +524,7 @@ class FusedRolloutEvaluator {
     if (!(tolerance >= 0.0) || !std::isfinite(tolerance)) {
       throw std::runtime_error("screening tolerance must be finite and nonnegative");
     }
-    model_->opt.integrator = mjINT_IMPLICITFAST;
+    model_->opt.integrator = mjINT_IMPLICIT;
     model_->opt.timestep = timestep;
     model_->opt.iterations = std::max(1, iterations);
     model_->opt.ls_iterations = std::max(0, ls_iterations);
@@ -1143,33 +1143,43 @@ class FusedRolloutEvaluator {
         r[2] * dx + r[5] * dy + r[8] * dz};
     const mjtNum* half = model_->geom_size + 3 * task_geom_id_;
 
-    double best = std::numeric_limits<double>::infinity();
+    // Use the SIDE FACE CENTER as the approach target. Merely measuring
+    // distance to the nearest point of a side face lets the tool approach
+    // from above near its upper edge.
+    double best_alignment = -std::numeric_limits<double>::infinity();
+    int best_axis = 0;
+    double best_sign = 1.0;
     for (int axis = 0; axis < 2; ++axis) {
-      // Column ``axis`` of geom_xmat is the box-local axis in world space.
       const double axis_x = r[axis];
       const double axis_y = r[3 + axis];
       for (const double sign : {-1.0, 1.0}) {
-        // Inward pushing direction is opposite the outward face normal.
         const double alignment = (-sign * axis_x) * dir_x +
                                  (-sign * axis_y) * dir_y;
-        if (alignment <= 1e-9) {
-          continue;
+        if (alignment > best_alignment) {
+          best_alignment = alignment;
+          best_axis = axis;
+          best_sign = sign;
         }
-        double q[3] = {
-            std::min(std::max(local[0], -static_cast<double>(half[0])), static_cast<double>(half[0])),
-            std::min(std::max(local[1], -static_cast<double>(half[1])), static_cast<double>(half[1])),
-            std::min(std::max(local[2], -static_cast<double>(half[2])), static_cast<double>(half[2]))};
-        q[axis] = sign * static_cast<double>(half[axis]);
-        const double ex = local[0] - q[0];
-        const double ey = local[1] - q[1];
-        const double ez = local[2] - q[2];
-        best = std::min(best, std::sqrt(ex * ex + ey * ey + ez * ez));
       }
     }
-    if (std::isfinite(best)) {
-      return best;
-    }
-    return TipToTaskBoxSurfaceDistance(d, x, y, z);
+    const double hx = static_cast<double>(half[0]);
+    const double hy = static_cast<double>(half[1]);
+    const double hz = static_cast<double>(half[2]);
+    const double desired[3] = {
+        best_axis == 0 ? best_sign * hx : 0.0,
+        best_axis == 1 ? best_sign * hy : 0.0,
+        0.0};
+    const double dist = std::sqrt(
+        (local[0] - desired[0]) * (local[0] - desired[0]) +
+        (local[1] - desired[1]) * (local[1] - desired[1]) +
+        (local[2] - desired[2]) * (local[2] - desired[2]));
+    // Strongly discourage approaching from above the box, even if near a
+    // face edge. Penalize crossing inside the selected back face as well.
+    const double above = std::max(0.0, local[2] - 0.25 * hz);
+    const double behind = best_sign * local[best_axis];
+    const double inside = std::max(0.0,
+        (best_axis == 0 ? hx : hy) - behind);
+    return dist + 10.0 * above + 5.0 * inside;
   }
 
   void ApplyRateLimitedCtrl(mjData* d, const double* requested, int nu,
@@ -1617,8 +1627,11 @@ class FusedRolloutEvaluator {
             failed = true;
             break;
           }
-          face_distance_sum += TipToTaskBoxSurfaceDistance(d, root_x, root_y, root_z);
           const mjtNum* goal = d->site_xpos + 3 * point_push_goal_site_id_;
+          // Light shaping: nearest box surface (including top). The box-goal
+          // distance has the dominant weight in mode 4.
+          face_distance_sum += TipToTaskBoxSurfaceDistance(
+              d, root_x, root_y, root_z);
           const double gx = xw - static_cast<double>(goal[0]);
           const double gy = yw - static_cast<double>(goal[1]);
           const double gz = d->qpos[j.task_qadr + 2] - static_cast<double>(goal[2]);
@@ -1727,8 +1740,8 @@ class FusedRolloutEvaluator {
                      + j.reach_terminal_weight * last_distance / face_scale;
       }
       if (j.task_mode == 4) {
-        // Three-term objective only: both distances averaged over the horizon
-        // plus the same tiny nominal command regularizer. No extra shaping.
+        // The two distance terms are active by default (box-goal dominates).
+        // Optional command regularizer can be enabled with a nonzero weight.
         j.costs[i] = j.robot_box_approach_weight * face_distance_sum * inv_h
                      + j.target_error_weight * point_push_goal_distance_sum * inv_h
                      + control_cost * inv_h;
@@ -1807,6 +1820,8 @@ class FusedRolloutEvaluator {
   std::atomic<int> next_{0};
 };
 
+void bind_ball_fused(py::module_& m);
+
 PYBIND11_MODULE(_fused_mujoco, m) {
   m.doc() = "Fused MuJoCo rollout + track/task cost evaluator";
   py::class_<FusedRolloutEvaluator>(m, "FusedRolloutEvaluator")
@@ -1863,4 +1878,5 @@ PYBIND11_MODULE(_fused_mujoco, m) {
       .def_property_readonly("command_limit_abi", [](const FusedRolloutEvaluator&) { return 2; })
       .def_property_readonly("simple_reward_abi", [](const FusedRolloutEvaluator&) { return 5; })
       .def_property_readonly("point_push_abi", [](const FusedRolloutEvaluator&) { return 1; });
+  bind_ball_fused(m);
 }

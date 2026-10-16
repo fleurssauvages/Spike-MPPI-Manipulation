@@ -75,6 +75,27 @@ Detailed code and install for a locomotion task and Ant robot is available at: h
   </tr>
 </table>
 
+<h3 align="center">Bouncing</h3>
+
+<table align="center" width="100%">
+  <tr>
+    <th width="50%">Spike-MPPI (32 rollouts)</th>
+    <th width="50%">Standard MPPI (32 rollouts)</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="manipulation/results/spike_bouncing.gif"
+           width="100%"
+           alt="Spike-MPPI bouncing">
+    </td>
+    <td align="center">
+      <img src="manipulation/results/standard_bouncing.gif"
+           width="100%"
+           alt="Standard MPPI bouncing">
+    </td>
+  </tr>
+</table>
+
 ## Results on 100 reaching runs
 
 <h3 align="center">Normalized Reaching Progress</h3>

@@ -1,0 +1,28 @@
+<mujoco model="franka_ball_bouncing">
+  <include file="panda_ball_bouncing.xml"/>
+  <option timestep="0.005" integrator="implicit" solver="Newton"
+          iterations="100" ls_iterations="30" tolerance="1e-10"
+          noslip_iterations="5" noslip_tolerance="1e-9" cone="elliptic" density="1.225" viscosity="0.0000181"/>
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.3 0.3 0.3"/>
+    <global azimuth="135" elevation="-22"/>
+  </visual>
+  <worldbody>
+    <light pos="0.5 0 1.6" dir="0.2 0 -1" directional="true"/>
+    <geom name="floor" type="plane" size="2 2 .05" rgba=".19 .22 .25 1" friction="1 0.01 0.001"/>
+    <!-- A free rigid ball: its position and velocity are propagated by contact dynamics. -->
+    <body name="reach_target" pos="0.5545 0.125 0.50">
+      <freejoint name="reach_target_free"/>
+      <geom name="reach_target_geom" type="sphere" size="0.018" mass="0.020" rgba="0.96 0.74 0.19 1" friction="0.8 0.008 0.0006" condim="6" solref="0.015 0.75" fluidshape="ellipsoid" fluidcoef="0.47 0.25 1.5 0.0 1.0"/>
+    </body>
+  </worldbody>
+  <!-- World-space pose/velocity of a rigid tool frame, sampled at every physics step. -->
+  <sensor>
+    <framepos name="ball_tool_pos" objtype="site" objname="ball_tool_surface"/>
+    <framexaxis name="ball_tool_x" objtype="site" objname="ball_tool_surface"/>
+    <frameyaxis name="ball_tool_y" objtype="site" objname="ball_tool_surface"/>
+    <framezaxis name="ball_tool_z" objtype="site" objname="ball_tool_surface"/>
+    <framelinvel name="ball_tool_linvel" objtype="site" objname="ball_tool_surface"/>
+    <frameangvel name="ball_tool_angvel" objtype="site" objname="ball_tool_surface"/>
+  </sensor>
+</mujoco>

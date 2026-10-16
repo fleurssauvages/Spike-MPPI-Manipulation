@@ -1,4 +1,4 @@
-"""Independent seeded square-pushing trials, matching the reaching batch workflow."""
+"""Independent seeded pushing-route trials, matching the reaching batch workflow."""
 from __future__ import annotations
 
 import argparse
@@ -25,7 +25,7 @@ ANALYSIS_KEYS = frozenset({
 
 def make_batch_parser() -> argparse.ArgumentParser:
     parser = make_parser()
-    parser.description = "Independent Franka square/pingpong pushing trials"
+    parser.description = "Independent Franka two-point/square/pingpong pushing trials"
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--seed-start", type=int, default=None)
     parser.add_argument("--output-dir", default="manipulation/results/pushing_batch")

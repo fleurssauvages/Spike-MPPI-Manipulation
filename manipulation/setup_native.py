@@ -51,7 +51,8 @@ if not libraries:
 
 ext = Extension(
     "manipulation._fused_mujoco",
-    sources=[str(package_dir / "native" / "fused_mujoco.cpp")],
+    sources=[str(package_dir / "native" / "fused_mujoco.cpp"),
+             str(package_dir / "native" / "fused_ball.cpp")],
     include_dirs=[pybind11.get_include(), np.get_include(), str(include_dir)],
     extra_objects=[str(libraries[-1])],
     language="c++",

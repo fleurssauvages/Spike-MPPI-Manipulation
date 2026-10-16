@@ -1,7 +1,10 @@
 <mujoco model="franka_panda_pushing">
-  <include file="panda_slim.xml"/>
+  <!-- Dedicated pushing model, not rewritten by auto-fetch. -->
+  <include file="panda_pushing_custom.xml"/>
 
-  <option timestep="0.002"/>
+  <option timestep="0.005" integrator="implicit" solver="Newton"
+          iterations="100" ls_iterations="30" tolerance="1e-10"
+          noslip_iterations="5" noslip_tolerance="1e-9" cone="elliptic"/>
 
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
@@ -24,26 +27,27 @@
           friction="1 0.01 0.001"/>
 
     <!-- Start keypoint: the physical box is initialized on this point. -->
-    <site name="push_start_keypoint" type="sphere" pos="0.55 0.00 0.385"
+    <site name="push_start_keypoint" type="sphere" pos="0.55 0.00 0.370"
           size="0.007" rgba="1.0 0.55 0.17 0.55"/>
 
     <!-- Non-colliding visual indicators of the three other square corners.
          The active green ghost box still marks the current MPPI target. -->
-    <site name="push_waypoint_1" type="sphere" pos="0.55 0.18 0.385"
+    <site name="push_waypoint_1" type="sphere" pos="0.55 0.18 0.370"
           size="0.009" rgba="0.40 0.70 1.00 0.85"/>
-    <site name="push_waypoint_2" type="sphere" pos="0.73 0.18 0.385"
+    <site name="push_waypoint_2" type="sphere" pos="0.73 0.18 0.370"
           size="0.009" rgba="0.40 0.70 1.00 0.85"/>
-    <site name="push_waypoint_3" type="sphere" pos="0.73 0.00 0.385"
+    <site name="push_waypoint_3" type="sphere" pos="0.73 0.00 0.370"
           size="0.009" rgba="0.40 0.70 1.00 0.85"/>
 
-    <geom name="table" type="box" pos="0.55 0 0.32" size="0.38 0.42 0.025" rgba="0.37 0.39 0.42 1" friction="0.9 0.02 0.002"/>
-    <body name="reach_target" pos="0.55 0 0.385">
+    <!-- Physical box: 32 cm x 32 cm in XY, 5 cm tall. -->
+    <geom name="table" type="box" pos="0.55 0 0.32" size="0.38 0.42 0.025" rgba="0.37 0.39 0.42 1" friction="0.85 0.012 0.002" condim="6" priority="2" margin="0.002" solref="0.012 1.0" solimp="0.97 0.995 0.001 0.5 2"/>
+    <body name="reach_target" pos="0.55 0 0.370">
       <freejoint name="reach_target_free"/>
-      <geom name="reach_target_geom" type="box" size="0.032 0.032 0.040" mass="0.13" rgba="0.95 0.50 0.18 1" friction="0.8 0.015 0.002"/>
+      <geom name="reach_target_geom" type="box" size="0.032 0.032 0.032" mass="0.5" rgba="0.95 0.50 0.18 1" friction="0.40 0.012 0.002" condim="6" priority="2" margin="0.002" solref="0.012 1.0" solimp="0.97 0.995 0.001 0.5 2"/>
     </body>
-    <body name="push_goal" mocap="true" pos="0.55 0.18 0.385">
+    <body name="push_goal" mocap="true" pos="0.55 0.18 0.370">
       <site name="push_goal_site" pos="0 0 0" size="0.005" rgba="0.16 0.90 0.28 0.7"/>
-      <geom name="push_goal_geom" type="box" size="0.032 0.032 0.040" rgba="0.16 0.90 0.28 0.32" contype="0" conaffinity="0"/>
+      <geom name="push_goal_geom" type="box" size="0.032 0.032 0.032" rgba="0.16 0.90 0.28 0.10" contype="0" conaffinity="0"/>
     </body>
   </worldbody>
 </mujoco>

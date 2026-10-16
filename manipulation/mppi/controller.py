@@ -123,7 +123,7 @@ class ControllerConfig:
     # Standard / spectrum-matched Gaussian / Poisson / Spike comparisons.
     # Both values at zero recover the unscreened path.
     # When enabled, ``screen_pool_size`` candidates are ranked with the existing
-    # full-horizon implicitfast preview and only ``num_rollouts`` are evaluated
+    # full-horizon RK4 preview and only ``num_rollouts`` are evaluated
     # at full fidelity.
     screen_pool_size: int = 0
     screen_exploit: int = 0
@@ -529,10 +529,9 @@ class JointMPPIController:
                 robot, workers=cfg.rollout_workers,
                 batch_hint=max(cfg.num_rollouts, cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts),
                 chunk_size=cfg.rollout_chunk_size,
-                # Ball tasks supply a contact-aware Python cost over MuJoCo's
-                # native batched state/sensor trajectories. The existing C++
-                # evaluator does not implement those objectives.
-                fused=not hasattr(robot, "evaluate_ball_rollouts"),
+                # All tasks have native cost evaluators. Ball tasks use the
+                # separate fused ball evaluator, preserving legacy task modes.
+                fused=True,
                 screening=self._screen_enabled,
             )
         except Exception:
@@ -713,7 +712,7 @@ class JointMPPIController:
                     "Poisson events + ordered motor-unit recruitment + causal twitch; "
                     f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
                     f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
-                    f"scale={self.cfg.proposal_scale_mode}, preview=implicitfast, full update unchanged, "
+                    f"scale={self.cfg.proposal_scale_mode}, preview=RK4, full update unchanged, "
                     f"implementation={self._poisson_sampler_backend}"
                 )
             poisson_channels = int(self._poisson_channels.shape[0])
@@ -752,7 +751,7 @@ class JointMPPIController:
                 "standard MPPI Gaussian sampling with full-horizon screening: "
                 f"Npool={self.cfg.screen_pool_size}, preview_H={self.cfg.horizon}, "
                 f"select={self.cfg.screen_exploit}+{self.cfg.num_rollouts-self.cfg.screen_exploit}, "
-                f"preview=implicitfast, full update unchanged, implementation={self._standard_sampler_backend}"
+                f"preview=RK4, full update unchanged, implementation={self._standard_sampler_backend}"
             )
         return f"standard MPPI Gaussian sampling; implementation={self._standard_sampler_backend}"
 

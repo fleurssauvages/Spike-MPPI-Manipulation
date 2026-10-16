@@ -1,8 +1,7 @@
 """Run reproducible Franka ball-manipulation MPPI experiments.
 
 Separates task-specific loss functions and scene variants while using the exact
-same MPPI controller/sampling APIs as reaching/pushing. The stock MuJoCo batch
-rollout path evaluates those losses from per-physics-step states and sensors.
+same MPPI controller/sampling APIs as reaching/pushing. A task-specific fused C++ backend evaluates these losses during physics rollouts.
 """
 from __future__ import annotations
 
@@ -15,6 +14,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+import mujoco
 
 from manipulation.mppi import ControllerConfig, JointMPPIController, SamplingOption
 from manipulation.priors import GeometricPrior
@@ -32,10 +32,13 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--sampling", choices=[a.value for a in SamplingOption], default="spike")
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--steps", type=int, default=1000 if task == "balancing" else 400)
+    p.add_argument("--steps", type=int, default=2000 if task == "balancing" else 800)
     p.add_argument("--horizon", type=int, default=20)
-    p.add_argument("--rollouts", type=int, default=32)
-    p.add_argument("--control-dt", type=float, default=0.02)
+    p.add_argument("--rollouts", type=int, default=128)
+    p.add_argument("--control-dt", type=float, default=0.01)
+    p.add_argument("--physics-dt", type=float, default=None,
+                   help="Override XML physics timestep (default 0.005 s); "
+                        "use 0.005 for two physics substeps at 100 Hz")
     p.add_argument("--joint-noise", type=float, default=0.08)
     p.add_argument("--noise-space", choices=("joint", "effector"), default="effector")
     p.add_argument("--effector-noise-std", type=float, default=0.01)
@@ -49,17 +52,31 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--offset-y", type=float, default=-0.025 if task == "balancing" else 0.0)
     p.add_argument("--velocity-x", type=float, default=0.09 if task == "balancing" else 0.015)
     p.add_argument("--velocity-y", type=float, default=0.00 if task == "balancing" else 0.0)
+    p.add_argument("--wind-x", type=float, default=0.0,
+                   help="Ambient world-frame wind X (m/s)")
+    p.add_argument("--wind-y", type=float, default=0.0,
+                   help="Ambient world-frame wind Y (m/s)")
+    p.add_argument("--wind-z", type=float, default=0.0,
+                   help="Ambient world-frame wind Z (m/s)")
+    p.add_argument("--spin-x", type=float, default=0.0,
+                   help="Initial world-frame ball spin X (rad/s)")
+    p.add_argument("--spin-y", type=float, default=28.0 if task == "bouncing" else 0.0,
+                   help="Initial world-frame ball spin Y (rad/s)")
+    p.add_argument("--spin-z", type=float, default=0.0,
+                   help="Initial world-frame ball spin Z (rad/s)")
     p.add_argument("--drop-height", type=float, default=0.23,
                    help="For bouncing, initial height ABOVE the racket (ball radius excluded)")
     if task == "bouncing":
-        p.add_argument("--target-apex", type=float, default=0.23,
+        p.add_argument("--target-apex", type=float, default=0.2,
                        help="Target apex above racket surface (m), ball radius excluded")
-        p.add_argument("--target-bounces", type=int, default=5)
+        p.add_argument("--target-bounces", type=int, default=50)
     p.add_argument("--save", type=str, default=None,
                    help="Output NPZ path; default: results/franka_ball_<task>/<sampling>_<seed>.npz")
     p.add_argument("--no-save", action="store_true")
     p.add_argument("--continue-after-failure", action="store_true")
     p.add_argument("--no-auto-fetch", action="store_true")
+    p.add_argument("--allow-stock-rollout", action="store_true",
+                   help="Allow slower non-fused MuJoCo rollout for cost debugging")
     p.add_argument("--viewer", dest="viewer", action="store_true", help="Show MuJoCo viewer (default for interactive runs)")
     p.add_argument("--no-viewer", dest="viewer", action="store_false", help="Run headless")
     p.set_defaults(viewer=True)
@@ -115,14 +132,30 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("target-apex and target-bounces must be positive")
     if args.drop_height < 0:
         raise ValueError("drop-height must be nonnegative")
+    if args.physics_dt is not None and (not np.isfinite(args.physics_dt) or args.physics_dt <= 0):
+        raise ValueError("physics-dt must be finite and positive")
+    if not np.all(np.isfinite([args.spin_x, args.spin_y, args.spin_z])):
+        raise ValueError("ball spin must be finite")
+    if not np.all(np.isfinite([args.wind_x, args.wind_y, args.wind_z])):
+        raise ValueError("ambient wind must be finite")
 
     robot = FrankaBallRobot(
         task=task, auto_fetch=not args.no_auto_fetch,
         motion_limit_scale=args.motion_limit_scale,
         initial_ball_offset_xy=(args.offset_x, args.offset_y),
         initial_ball_velocity_xy=(args.velocity_x, args.velocity_y),
+        initial_ball_spin_xyz=(args.spin_x, args.spin_y, args.spin_z),
         drop_height=args.drop_height,
     )
+    # Look up the free ball's body once, then read its height after each step.
+    ball_body_id = mujoco.mj_name2id(
+        robot.model, mujoco.mjtObj.mjOBJ_BODY, "reach_target"
+    )
+    if ball_body_id < 0:
+        raise ValueError("Ball body 'reach_target' not found in MuJoCo model")
+    if args.physics_dt is not None:
+        robot.model.opt.timestep = float(args.physics_dt)
+    robot.model.opt.wind[:] = [args.wind_x, args.wind_y, args.wind_z]
     if task == "bouncing":
         robot.cost_weights = replace(robot.cost_weights, target_apex_m=float(args.target_apex))
     controller = build_controller(robot, args)
@@ -133,9 +166,13 @@ def run(args: argparse.Namespace) -> dict:
             "The ball tasks require mujoco.rollout with per-step frame sensors. "
             "Install the MuJoCo Python package and use a compatible version."
         )
-    if getattr(controller.rollout_batcher, "fused_evaluator", None) is not None:
+    if controller.rollout_batcher.ball_evaluator is None and not args.allow_stock_rollout:
         controller.close()
-        raise RuntimeError("ball task must not use the reaching/pushing fused evaluator")
+        raise RuntimeError(
+            f"Expected native fused ball evaluator (got {backend!r}). "
+            "Build with `python manipulation/setup_native.py build_ext --inplace` "
+            "or pass --allow-stock-rollout for reference/debugging."
+        )
 
     physics_per_control = int(controller.control_substeps)
     sample = robot.snapshot()
@@ -144,6 +181,7 @@ def run(args: argparse.Namespace) -> dict:
                "controls": [], "ball_xyz": [robot.task_xyz()],
                "tool_xyz": [robot.tip_xyz()], "ball_xy_local": [],
                "ball_v_xy_local": [], "ball_gap": [], "bounce_count": [0],
+               "ball_spin_xyz": [robot.data.qvel[robot._task_dof_adr+3:robot._task_dof_adr+6].copy()],
                "best_cost": [], "weighted_rollout_cost": [], "ess": [],
                "temperature": [], "compute_ms": [], "sampling_ms": [],
                "rollout_ms": []}
@@ -153,9 +191,13 @@ def run(args: argparse.Namespace) -> dict:
     history["ball_gap"].append(gap)
     viewer = None
     if args.viewer:
-        import mujoco.viewer
-        viewer = mujoco.viewer.launch_passive(robot.model, robot.data,
-            show_left_ui=args.viewer_ui, show_right_ui=args.viewer_ui)
+        from mujoco import viewer as mj_viewer
+        viewer = mj_viewer.launch_passive(
+            robot.model,
+            robot.data,
+            show_left_ui=args.viewer_ui,
+            show_right_ui=args.viewer_ui,
+        )
         viewer.cam.lookat[:] = [0.55, 0.12, 0.51]
         viewer.cam.distance = 1.25
         viewer.cam.azimuth = 145
@@ -188,6 +230,9 @@ def run(args: argparse.Namespace) -> dict:
             history["ball_v_xy_local"].append(vxy)
             history["ball_gap"].append(gap)
             history["bounce_count"].append(int(robot.bounce_count))
+            history["ball_spin_xyz"].append(
+                robot.data.qvel[robot._task_dof_adr+3:robot._task_dof_adr+6].copy()
+            )
             for key in ("best_cost", "weighted_rollout_cost", "ess", "temperature"):
                 history[key].append(float(info.get(key, float("nan"))))
             for key, src in (("compute_ms", "total"), ("sampling_ms", "sampling"),
@@ -196,7 +241,9 @@ def run(args: argparse.Namespace) -> dict:
 
             radius = max(robot.tool_half_width - robot.ball_radius, 1e-6)
             if task == "balancing":
-                failure = (np.max(np.abs(xy)) > radius or gap < -0.035 or gap > 0.085)
+                ball_z = robot.data.xpos[ball_body_id, 2]
+                ground_z = 0.0  # Ground surface height in world coordinates.
+                failure = ball_z < ground_z + 2.0 * robot.ball_radius
             else:
                 failure = (gap < -0.055 or
                            (np.max(np.abs(xy)) > radius + 0.055 and gap < 0.05))
@@ -239,6 +286,8 @@ def run(args: argparse.Namespace) -> dict:
             cost_weights_json=np.asarray(json.dumps(asdict(robot.cost_weights))),
             initial_ball_offset_xy=np.asarray([args.offset_x, args.offset_y]),
             initial_ball_velocity_xy=np.asarray([args.velocity_x, args.velocity_y]),
+            initial_ball_spin_xyz=np.asarray([args.spin_x, args.spin_y, args.spin_z]),
+            ambient_wind_xyz=np.asarray([args.wind_x, args.wind_y, args.wind_z]),
             drop_height=np.asarray(args.drop_height),
             qpos=array("qpos"), qvel=array("qvel"), act=array("act"),
             state_time=array("state_time"), controls=array("controls"),
@@ -246,6 +295,7 @@ def run(args: argparse.Namespace) -> dict:
             ball_xy_local=array("ball_xy_local"),
             ball_v_xy_local=array("ball_v_xy_local"), ball_gap=array("ball_gap"),
             bounce_count=np.asarray(history["bounce_count"], dtype=np.int64),
+            ball_spin_xyz=array("ball_spin_xyz"),
             best_cost=array("best_cost"), weighted_rollout_cost=array("weighted_rollout_cost"),
             ess=array("ess"), temperature=array("temperature"),
             compute_ms=array("compute_ms"), sampling_ms=array("sampling_ms"),
@@ -259,6 +309,7 @@ def run(args: argparse.Namespace) -> dict:
         "failed": bool(failure), "steps": int(n_steps),
         "duration_s": float(history["state_time"][-1] - history["state_time"][0]),
         "bounces": int(robot.bounce_count),
+        "mean_ball_spin_rad_s": float(np.linalg.norm(array("ball_spin_xyz"), axis=-1).mean()),
         "final_xy_error_m": float(np.linalg.norm(array("ball_xy_local")[-1])),
         "mean_xy_error_m": float(np.linalg.norm(array("ball_xy_local"), axis=-1).mean()),
         "mean_compute_ms": float(np.mean(compute[np.isfinite(compute)])) if np.isfinite(compute).any() else float("nan"),

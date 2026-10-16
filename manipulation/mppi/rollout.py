@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, astuple
 import math
 import os
 from pathlib import Path
@@ -157,6 +157,7 @@ class NativeRolloutBatcher:
         self.last_rollout_cost_ms = 0.0
         self.last_rollout_fused_ms = 0.0
         self.fused_evaluator = None
+        self.ball_evaluator = None
         self.screening_evaluator = None
         self.fused_requested = bool(fused)
         self.screening_requested = bool(screening)
@@ -182,6 +183,9 @@ class NativeRolloutBatcher:
             self._init_fused_evaluator()
 
     def _init_fused_evaluator(self) -> None:
+        if hasattr(self.robot, "evaluate_ball_rollouts"):
+            self._init_fused_ball_evaluator()
+            return
         if self._task_qadr is None:
             raise RuntimeError('fused rollout requires a free-joint task body')
         if self._root_qadr is None and self._root_body_id < 0:
@@ -269,6 +273,37 @@ class NativeRolloutBatcher:
         finally:
             Path(model_path).unlink(missing_ok=True)
 
+    def _init_fused_ball_evaluator(self) -> None:
+        """Create the independent fused MuJoCo ball physics + cost evaluator.
+
+        A newly compiled binary is required: older native extensions implement
+        only the other task modes. Never silently fall back to mismatched costs.
+        """
+        import tempfile
+        from manipulation import _fused_mujoco
+        cls = getattr(_fused_mujoco, "BallFusedEvaluator", None)
+        if cls is None:
+            raise RuntimeError(
+                "Native ball evaluator missing: rebuild the extension with "
+                "`python manipulation/setup_native.py build_ext --inplace`"
+            )
+        with tempfile.NamedTemporaryFile(suffix=".mjb", delete=False) as tmp:
+            model_path = tmp.name
+        try:
+            self.mj.mj_saveModel(self.model, model_path)
+            self.ball_evaluator = cls(
+                model_path, int(self.nthread),
+                int(self.chunk_size) if self.chunk_size > 0 else 1,
+                str(self.robot.task),
+                np.ascontiguousarray(self._joint_velocity_limits, dtype=np.float64),
+                float(self._motion_limit_scale),
+            )
+            if int(getattr(self.ball_evaluator, "task_abi", -1)) != 1:
+                raise RuntimeError("Native ball evaluator has old ABI: rebuild the extension")
+            self.supports_vectorized_cost = True
+        finally:
+            Path(model_path).unlink(missing_ok=True)
+
     def sync_fused_model(self) -> None:
         """Reload the fused model after explicit online model-parameter updates."""
         if not self.fused_requested:
@@ -276,6 +311,7 @@ class NativeRolloutBatcher:
         # Destroying the old object joins its persistent workers before loading
         # the newly serialized planning model. This is outside the MPPI hot path.
         self.fused_evaluator = None
+        self.ball_evaluator = None
         self.screening_evaluator = None
         self._screening_config = None
         self._fused_param_owner = None
@@ -283,10 +319,11 @@ class NativeRolloutBatcher:
 
     @property
     def uses_fused(self) -> bool:
-        return self.fused_evaluator is not None
+        return self.fused_evaluator is not None or self.ball_evaluator is not None
 
     def close(self) -> None:
         self.fused_evaluator = None
+        self.ball_evaluator = None
         self.screening_evaluator = None
         runner = getattr(self, 'runner', None)
         if runner is not None:
@@ -689,7 +726,7 @@ class NativeRolloutBatcher:
         """Cheap fused preview used only to rank candidate control sequences.
 
         The screening evaluator owns a separate copy of the planning model. It
-        runs MuJoCo ``implicitfast`` with one physics step per supplied control
+        runs MuJoCo ``RK4`` with one physics step per supplied control
         bin, so changing its solver/timestep cannot alter the full-fidelity
         evaluator or the executed plant. The returned cost uses the same manipulation
         objective over the shorter supplied horizon.
@@ -737,6 +774,37 @@ class NativeRolloutBatcher:
             np.asarray(progress), np.asarray(failed, dtype=bool),
         )
 
+    def _verify_ball_costs(self, snapshot, batch, nominal, substeps, costs, failed):
+        """First-call parity against reference MuJoCo physics + NumPy cost.
+
+        Verifies a small deterministic subset of rollouts (not a synthetic
+        surrogate) and immediately catches weights/control/state mismatches.
+        """
+        sample = np.linspace(0, len(batch)-1, min(3, len(batch)), dtype=int)
+        controls = self.robot.limit_rollout_controls(
+            batch[sample], snapshot.ctrl, substeps * self.robot.physics_dt
+        )
+        expanded = self._expand_controls(controls, substeps)
+        init = self.snapshot_to_state(snapshot)[None, :]
+        states = self.rollout_states(init, expanded)
+        sensors = self._last_rollout_sensors
+        if sensors is None:
+            raise RuntimeError("ball native parity check requires MuJoCo frame sensors")
+        ref_costs, ref_fail = self.robot.evaluate_ball_rollouts(
+            states, sensors, controls, nominal, snapshot.ctrl,
+            self._ctrl_scale, substeps=substeps,
+        )
+        mask = np.isfinite(ref_costs) & np.isfinite(costs[sample])
+        if not np.array_equal(np.asarray(ref_fail, dtype=bool), failed[sample]) or (
+            np.any(mask) and not np.allclose(
+                ref_costs[mask], costs[sample][mask], rtol=2e-3, atol=2e-3
+            )
+        ):
+            raise RuntimeError(
+                "Native ball fused cost differs from Python reference. "
+                f"native={costs[sample].tolist()}, reference={ref_costs.tolist()}"
+            )
+
     def evaluate(
         self,
         start_snapshot,
@@ -755,8 +823,29 @@ class NativeRolloutBatcher:
         substeps = max(1, int(control_substeps))
 
         if hasattr(self.robot, "evaluate_ball_rollouts"):
-            if self.fused_evaluator is not None:
-                raise RuntimeError("ball costs require stock MuJoCo rollout, not the fused push evaluator")
+            if self.ball_evaluator is not None:
+                initial = self.snapshot_to_state(start_snapshot, out=self._state_pack)
+                nominal = np.ascontiguousarray(nominal_controls, dtype=np.float64)
+                params = np.asarray(astuple(self.robot.cost_weights), dtype=np.float64)
+                t0 = time.perf_counter()
+                positions, costs, progress, failed = self.ball_evaluator.evaluate(
+                    initial,
+                    np.ascontiguousarray(start_snapshot.ctrl, dtype=np.float64),
+                    batch, nominal, self._ctrl_scale, params, substeps,
+                )
+                self.last_rollout_fused_ms = 1e3 * (time.perf_counter() - t0)
+                self.last_rollout_physics_ms = self.last_rollout_fused_ms
+                self.last_rollout_cost_ms = 0.0
+                positions = np.asarray(positions, dtype=np.float64)
+                costs = np.asarray(costs, dtype=np.float64)
+                progress = np.asarray(progress, dtype=np.float64)
+                failed = np.asarray(failed, dtype=bool)
+                if self._verify_fused and not self._fused_verified:
+                    self._verify_ball_costs(start_snapshot, batch, nominal, substeps, costs, failed)
+                    self._fused_verified = True
+                return positions, costs, progress, failed
+            # Stock MuJoCo reference implementation, available when fused is
+            # explicitly disabled. Uses the identical model and cost functions.
             # Match FrankaReachRobot.step_control: the plant rate-limits each
             # position command. Ignore proposed commands beyond this envelope
             # during rollout rather than evaluating physically impossible moves.
@@ -1690,7 +1779,8 @@ def rollout_controls(
 
     inv_h = 1.0 / float(max(1, h))
     if point_pushing:
-        # Exactly three terms; physical contacts are simulated, not penalized.
+        # Only the two distance terms are active by default; the optional
+        # command regularizer is zero unless explicitly enabled.
         total = (float(cfg.robot_box_approach_weight) * face_distance_sum * inv_h
                  + float(cfg.target_error_weight) * goal_distance_sum * inv_h
                  + command_cost * inv_h)

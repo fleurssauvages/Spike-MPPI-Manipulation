@@ -49,10 +49,12 @@ def _prepare_replay(path: str | Path, *, auto_fetch: bool = True):
         offset = np.asarray(record.get("initial_ball_offset_xy", [0.0, 0.0]), dtype=np.float64).reshape(2)
         velocity = np.asarray(record.get("initial_ball_velocity_xy", [0.0, 0.0]), dtype=np.float64).reshape(2)
         drop_height = float(np.asarray(record.get("drop_height", 0.23)).reshape(()))
+        spin = np.asarray(record.get("initial_ball_spin_xyz", [0., 0., 0.]), dtype=np.float64).reshape(3)
         robot = FrankaBallRobot(
             task=task, auto_fetch=auto_fetch,
             initial_ball_offset_xy=(float(offset[0]), float(offset[1])),
             initial_ball_velocity_xy=(float(velocity[0]), float(velocity[1])),
+            initial_ball_spin_xyz=tuple(float(v) for v in spin),
             drop_height=drop_height,
         )
     elif robot_name == "franka-push":
@@ -72,6 +74,10 @@ def _prepare_replay(path: str | Path, *, auto_fetch: bool = True):
             robot.hide_waypoints()  # Older point-push recordings had no square sites.
     else:
         raise ValueError(f"unsupported replay robot {robot_name!r}")
+    if robot_name.startswith("franka-ball-"):
+        robot.model.opt.wind[:] = np.asarray(
+            record.get("ambient_wind_xyz", [0., 0., 0.]), dtype=np.float64
+        ).reshape(3)
     qpos = np.asarray(record["qpos"], dtype=np.float64)
     qvel = np.asarray(record["qvel"], dtype=np.float64)
     state_time = np.asarray(record["state_time"], dtype=np.float64).reshape(-1)

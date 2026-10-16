@@ -1,4 +1,4 @@
-"""Franka MPPI: move a box around four tabletop waypoints (no orientation)."""
+"""Franka MPPI: push a box between two or four tabletop waypoints."""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +18,7 @@ from .waypoints import (
     DEFAULT_START_XY as START_XY, DEFAULT_GOAL_XY as GOAL_XY,
     WaypointRoute, resolve_waypoints,
 )
+from .reposition import PushReposition
 
 
 def build_controller(
@@ -36,18 +37,17 @@ def build_controller(
     noise_space: str = "effector",
     effector_noise_std: float = 0.01,
     rollout_workers: int = 8,
-    tip_box_weight: float = 1.0,
-    box_goal_weight: float = 1.0,
-    control_deviation_weight: float = 1e-4,
+    tip_box_weight: float = 0.1,
+    box_goal_weight: float = 10.0,
+    control_deviation_weight: float = 0.0,
     lbps_delta: float = 0.95,
 ) -> JointMPPIController:
-    """All MPPI dynamics/samplers as reaching, with only three cost terms.
+    """Franka MPPI pushing with two distance terms active by default.
 
-    Cost = mean_t [tip_box_weight * tip_to_box_surface_distance(t)
-                 + box_goal_weight * box_center_to_goal_distance(t)
-                 + control_deviation_weight * mean_j(((u-u_nom)/s_j)**2)].
-
-    Exploration covariance is CONSTANT for the entire task (adaptive_noise=False).
+    Cost = mean_t [box_goal_weight * box_center_to_goal_distance(t)
+                   + tip_box_weight * tip_to_nearest_surface_distance(t)].
+    The optional control regularizer has default weight zero.
+    Exploration covariance remains constant (adaptive_noise=False).
     """
     cfg = ControllerConfig(
         control_dt=float(control_dt),
@@ -71,7 +71,7 @@ def build_controller(
         standard_sampler="auto",
         poisson_sampler="auto",
         spike_sampler="auto",
-        # The only three active terms for mode 4 are these weights.
+        # Only the box-to-goal and fingertip-to-box terms are active by default.
         robot_box_approach_weight=float(tip_box_weight),
         target_error_weight=float(box_goal_weight),
         control_deviation_weight=float(control_deviation_weight),
@@ -168,6 +168,8 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         raise ValueError("steps, goal-tolerance and hold-seconds must be positive")
     if args.cycles < 0:
         raise ValueError("--cycles must be nonnegative (0 repeats until --steps)")
+    if args.reposition_clearance <= 0 or args.reposition_standoff <= 0 or args.reposition_timeout <= 0:
+        raise ValueError("reposition clearance/standoff/timeout must be positive")
     for name in ("tip_box_weight", "box_goal_weight", "control_deviation_weight"):
         value = float(getattr(args, name))
         if not np.isfinite(value) or value < 0:
@@ -197,6 +199,10 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         origin_xy=tuple(points[0]), direction=tuple(direction),
         road_width=100.0, length=10.0,
     )
+    if args.physics_dt is not None:
+        if not np.isfinite(args.physics_dt) or args.physics_dt <= 0:
+            raise ValueError("physics-dt must be finite and positive")
+        robot.model.opt.timestep = float(args.physics_dt)
     controller = build_controller(
         robot, track,
         sampling=args.sampling,
@@ -270,6 +276,11 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
     closest_error = initial_error
     completed = False
     last_info: dict = {}
+    reposition: PushReposition | None = None
+    reposition_count = 0
+    reposition_steps = 0
+    reposition_failed = False
+    phase_hist = ["push"]
     step = -1
     t_wall = time.perf_counter()
     last_time = float(initial.time)
@@ -277,16 +288,40 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         if args.verbose:
             print(f"tabletop {args.route} push: {points.tolist()} "
                   f"(cycles={args.cycles if args.cycles else 'unlimited'})")
-            print(f"objective: {args.tip_box_weight:g} * tip-box surface distance + "
-                  f"{args.box_goal_weight:g} * box-goal distance + "
-                  f"{args.control_deviation_weight:g} * normalized control deviation")
+            objective = (f"{args.box_goal_weight:g} * box-goal distance + "
+                         f"{args.tip_box_weight:g} * fingertip-to-box surface distance")
+            if args.control_deviation_weight:
+                objective += (f" + {args.control_deviation_weight:g} * "
+                              "normalized control deviation")
+            print("objective:", objective)
             print(f"sampling={args.sampling} noise-space={args.noise_space} "
                   f"covariance=fixed (no near-goal decay); backend={backend}")
         for step in range(int(args.steps)):
-            action, info = controller.step(robot.data, 0.0)
+            was_repositioning = reposition is not None
+            if was_repositioning:
+                # Identical deterministic transfer for every sampling method;
+                # no MPPI optimization is performed during the transfer.
+                action = reposition.action(robot, float(args.control_dt))
+                info = {}
+                reposition_steps += 1
+            else:
+                action, info = controller.step(robot.data, 0.0)
+                last_info = info
             robot.step_control(action, substeps=controller.control_substeps)
+            if was_repositioning:
+                reposition.observe(robot, float(args.control_dt))
+                if reposition.failed:
+                    reposition_failed = True
+                    if args.verbose:
+                        print(f"reposition timed out after {reposition.elapsed:.2f}s "
+                              f"in phase {reposition.stage}")
+                elif reposition.finished:
+                    if args.verbose:
+                        print(f"reposition completed after {reposition.elapsed:.2f}s; "
+                              "resuming pushing MPPI")
+                    reposition = None
+                    controller.reset_warm_start()
             after = robot.snapshot()
-            last_info = info
             controller_times.append(float(info.get("timing_ms", {}).get("total", np.nan)))
             dt = max(0.0, float(after.time) - last_time)
             last_time = float(after.time)
@@ -295,14 +330,17 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
             act_hist.append(after.act.copy())
             time_hist.append(float(after.time))
             controls_hist.append(after.ctrl.copy())
+            phase_hist.append("reposition" if was_repositioning else "push")
 
             box_error = robot.box_goal_distance()  # Error to goal used for this step.
             tip_error = robot.tip_box_surface_distance()
             closest_error = min(closest_error, box_error)
-            arrived = route.observe(
-                distance=box_error, dt=dt,
-                tolerance=args.goal_tolerance, hold_seconds=args.hold_seconds,
-            )
+            arrived = None
+            if not was_repositioning:
+                arrived = route.observe(
+                    distance=box_error, dt=dt,
+                    tolerance=args.goal_tolerance, hold_seconds=args.hold_seconds,
+                )
             if arrived is not None:
                 arrival_steps.append(step + 1)
                 arrival_times.append(float(after.time))
@@ -312,6 +350,17 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
                           f"cycles completed={route.cycles_completed}")
                 if not route.done:
                     _retarget_goal(robot, controller, points[route.goal_index], viewer)
+                    if args.reposition_on_switch and route.mode == "backforth":
+                        reposition = PushReposition(
+                            goal_xy=tuple(points[route.goal_index]),
+                            clearance=float(args.reposition_clearance),
+                            standoff=float(args.reposition_standoff),
+                            max_seconds=float(args.reposition_timeout),
+                        )
+                        reposition_count += 1
+                        if args.verbose:
+                            print(f"repositioning fingertip before pushing toward "
+                                  f"{points[route.goal_index].tolist()}")
             # Record the goal active at each stored state (the NEW one on an
             # arrival frame, since the next controller update sees this goal).
             goal_hist.append(robot.goal_xyz())
@@ -345,6 +394,8 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
                 print(f"step={step+1} goal={route.goal_index} "
                       f"box-goal={robot.box_goal_distance():.4f}m "
                       f"tip-box={tip_error:.4f}m; cycles={route.cycles_completed}")
+            if reposition_failed:
+                break
             if route.done:
                 completed = True
                 if args.verbose:
@@ -380,6 +431,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
                 "box_goal_weight": np.asarray(float(args.box_goal_weight)),
                 "control_deviation_weight": np.asarray(float(args.control_deviation_weight)),
                 "adaptive_noise": np.asarray(False),
+                "reposition_on_switch": np.asarray(bool(args.reposition_on_switch)),
             })
         np.savez_compressed(
             path,
@@ -407,6 +459,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
             act=np.asarray(act_hist, dtype=np.float64),
             state_time=np.asarray(time_hist, dtype=np.float64),
             controls=np.asarray(controls_hist, dtype=np.float64).reshape((-1, robot.nu)),
+            control_phase=np.asarray(phase_hist, dtype="U12"),
         )
         dest = str(path)
 
@@ -429,6 +482,9 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         "mean_control_increment_l2": float(np.linalg.norm(np.diff(ctrl, axis=0), axis=1).mean())
             if len(ctrl) > 1 else float("nan"),
         "wall_time_s": float(elapsed),
+        "reposition_transfers": int(reposition_count),
+        "reposition_control_steps": int(reposition_steps),
+        "reposition_failed": bool(reposition_failed),
         "sampling": args.sampling,
         "noise_space": args.noise_space,
         "effector_noise_std_m": float(args.effector_noise_std),
@@ -442,37 +498,52 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
 
 
 def make_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Franka MPPI: push a box around four tabletop keypoints")
+    p = argparse.ArgumentParser(description="Franka MPPI: push a box along a two- or four-point route")
     p.add_argument("--sampling", choices=["standard", "poisson", "spike", "gaussian-poisson", "gaussian-spike"], default="spike")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--horizon", type=int, default=20)
     p.add_argument("--rollouts", type=int, default=32)
     p.add_argument("--control-dt", type=float, default=0.01)
+    p.add_argument("--physics-dt", type=float, default=None,
+                   help="Override XML physics timestep (default 0.005 s); "
+                        "use 0.005 for two physics substeps at 100 Hz")
     p.add_argument("--twitch-rise-s", type=float, default=0.016)
     p.add_argument("--twitch-decay-s", type=float, default=0.064)
     p.add_argument("--twitch-duration-s", type=float, default=0.200)
     p.add_argument("--joint-noise", type=float, default=0.15)
     p.add_argument("--noise-space", choices=["joint", "effector"], default="effector")
-    p.add_argument("--effector-noise-std", type=float, default=0.01)
+    p.add_argument("--effector-noise-std", type=float, default=0.005)
     p.add_argument("--rollout-workers", type=int, default=8)
     p.add_argument("--motion-limit-scale", type=float, default=1.0)
     p.add_argument("--start-xy", type=float, nargs=2, metavar=("X", "Y"), default=START_XY)
     p.add_argument("--goal-xy", type=float, nargs=2, metavar=("X", "Y"), default=GOAL_XY,
                    help="second corner; start->goal specifies the first square side")
-    p.add_argument("--route", choices=["square", "pingpong", "point"], default="square",
-                   help="square: A-B-C-D-A; pingpong: A-B-C-D-C-B-A; point: old A-B task")
+    p.add_argument("--route", choices=["backforth", "square", "pingpong", "point"], default="backforth",
+                   help="backforth: A-B-A (default); square: A-B-C-D-A; "
+                        "pingpong: A-B-C-D-C-B-A; point: one-way A-B")
     p.add_argument("--waypoints", type=float, nargs=8,
                    metavar=("AX", "AY", "BX", "BY", "CX", "CY", "DX", "DY"),
-                   help="override all four corners in visitation order (square/pingpong only)")
-    p.add_argument("--cycles", type=int, default=2,
-                   help="number of full traversals before stopping (0: repeat until --steps)")
-    p.add_argument("--tip-box-weight", type=float, default=1.0)
-    p.add_argument("--box-goal-weight", type=float, default=1.0)
-    p.add_argument("--control-deviation-weight", type=float, default=1e-4)
+                   help="override XY waypoints; backforth uses only A and B of the four pairs")
+    p.add_argument("--cycles", type=int, default=4,
+                   help="number of complete routes (backforth: A-B-A); 0 repeats until --steps")
+    p.add_argument("--tip-box-weight", type=float, default=0.1)
+    p.add_argument("--box-goal-weight", type=float, default=10.0)
+    p.add_argument("--control-deviation-weight", type=float, default=0.0)
     p.add_argument("--lbps-delta", type=float, default=0.95)
     p.add_argument("--goal-tolerance", type=float, default=0.025)
     p.add_argument("--hold-seconds", type=float, default=1.0)
-    p.add_argument("--steps", type=int, default=4000)
+    # Includes the deterministic transition around a 32 cm box after reversals.
+    p.add_argument("--steps", type=int, default=8000)
+    p.add_argument("--reposition-on-switch", dest="reposition_on_switch", action="store_true", default=True,
+                   help="Lift/cross/lower the tip to the new pushing side after each backforth goal change")
+    p.add_argument("--no-reposition", dest="reposition_on_switch", action="store_false",
+                   help="Original pure-MPPI reversal, without deterministic transition")
+    p.add_argument("--reposition-clearance", type=float, default=0.12,
+                   help="Tip height clearance above the box top during the crossing (m)")
+    p.add_argument("--reposition-standoff", type=float, default=0.045,
+                   help="Distance beyond the opposite box side face (m)")
+    p.add_argument("--reposition-timeout", type=float, default=9.0,
+                   help="Abort rather than push from the wrong side if a transfer cannot finish (s)")
     p.add_argument("--viewer", dest="viewer", action="store_true", default=True)
     p.add_argument("--no-viewer", dest="viewer", action="store_false")
     p.add_argument("--viewer-ui", action="store_true")

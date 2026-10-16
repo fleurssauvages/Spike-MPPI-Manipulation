@@ -1,8 +1,8 @@
 """Franka with a rigid offset tray/racket and a freely moving MuJoCo ball.
 
 The same seven actuators and all existing MPPI samplers are retained. The task
-cost is evaluated on stock MuJoCo batched rollouts with per-physics-step frame
-sensors, not the native fused reaching/pushing cost kernel.
+cost is fused into a dedicated native C++ evaluator, with the original
+MuJoCo batched state/sensor path retained for cost-parity verification.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from .franka import FrankaReachRobot
 
 
 class FrankaBallRobot(FrankaReachRobot):
-    fused_task_mode = 0  # no existing fused cost is valid for these contact tasks
+    fused_task_mode = 5  # ball evaluator is separate from legacy modes 1..4
 
     def __init__(
         self, *, task: str,
@@ -23,6 +23,7 @@ class FrankaBallRobot(FrankaReachRobot):
         motion_limit_scale: float = 1.0,
         initial_ball_offset_xy: tuple[float, float] = (0.0, 0.0),
         initial_ball_velocity_xy: tuple[float, float] = (0.0, 0.0),
+        initial_ball_spin_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
         drop_height: float = 0.24,
         xml_path: str | Path | None = None,
     ) -> None:
@@ -33,7 +34,10 @@ class FrankaBallRobot(FrankaReachRobot):
         self._tool_site_id = -1
         self._initial_offset = np.asarray(initial_ball_offset_xy, dtype=float).reshape(2)
         self._initial_velocity = np.asarray(initial_ball_velocity_xy, dtype=float).reshape(2)
-        if not np.all(np.isfinite(self._initial_offset)) or not np.all(np.isfinite(self._initial_velocity)):
+        self._initial_spin = np.asarray(initial_ball_spin_xyz, dtype=float).reshape(3)
+        if (not np.all(np.isfinite(self._initial_offset)) or
+            not np.all(np.isfinite(self._initial_velocity)) or
+            not np.all(np.isfinite(self._initial_spin))):
             raise ValueError("initial ball state must be finite")
         if not (np.isfinite(drop_height) and drop_height >= 0.0):
             raise ValueError("drop_height must be finite and nonnegative")
@@ -66,7 +70,7 @@ class FrankaBallRobot(FrankaReachRobot):
                 raise ValueError(f"missing three-component sensor {name}")
             adr = int(self.model.sensor_adr[sid])
             self._sensors[name] = slice(adr, adr + 3)
-        cost_module = import_module(f"manipulation.franka_ball_{task}.cost")
+        cost_module = import_module(f"manipulation.franka_{task}.cost")
         self._score_rollouts = cost_module.score_rollouts
         self.cost_weights = (cost_module.BalanceWeights() if task == "balancing"
                              else cost_module.BounceWeights())
@@ -106,7 +110,10 @@ class FrankaBallRobot(FrankaReachRobot):
         v = velocity[0] * axes[:, 0] + velocity[1] * axes[:, 1]
         dadr = int(self._task_dof_adr)
         self.data.qvel[dadr:dadr + 3] = v
-        self.data.qvel[dadr + 3:dadr + 6] = 0.0
+        # Free-joint angular qvel is in the world frame. The ball starts with
+        # physically consistent, deterministic spin; later contact generates
+        # additional spin through friction without scripted trajectories.
+        self.data.qvel[dadr + 3:dadr + 6] = self._initial_spin
         self.mujoco.mj_forward(self.model, self.data)
         self.bounce_count = 0
         self.last_outgoing_vz = float("nan")

@@ -1,6 +1,6 @@
 <mujoco model="panda_single_finger">
   <compiler angle="radian" meshdir="assets" autolimits="true" />
-  <option integrator="implicitfast" />
+  <option timestep="0.005" integrator="implicit" />
   <default>
     <default class="panda">
       <material specular="0.5" shininess="0.25" />

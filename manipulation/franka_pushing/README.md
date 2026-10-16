@@ -1,104 +1,105 @@
-# Franka box pushing: four tabletop waypoints
+# Franka box pushing — dedicated long-finger tool
 
-A standalone `franka_pushing` task alongside `franka_reaching`, sharing the **same** Panda arm, single-finger tool, MPPI controller, sampling methods, warm start, LBPS temperature adaptation, motion limits, physics, replay, and batch infrastructure.
+Launch (from the parent of `manipulation/`):
 
-The physical box is initially at corner **A**. Its active goal advances to the next corner only once its **center** remains within the position tolerance for the required dwell time. The box is **not teleported or reset** when the target changes. There is no box/tool orientation objective. The current goal is shown by the green, non-colliding ghost box; the four corners are also shown by colored sites.
-
-## Default square
-
-The first two corners come from `--start-xy` and `--goal-xy`. The remaining corners are obtained by a clockwise 90-degree rotation of the first edge, keeping equal-length sides. Defaults (metres):
-
-```
-    B = (0.55, 0.18) ------ C = (0.73, 0.18)
-         |                          |
-         |                          |
-    A = (0.55, 0.00) ------ D = (0.73, 0.00)
-      initial box
+```bash
+python -m manipulation.franka_pushing.run --sampling spike
 ```
 
-Available traversals:
+- The pushing scene is `robots/assets/franka_emika_panda/franka_pushing_scene.xml`.
+- It includes **`panda_pushing_custom.xml`**, rather than auto-generated
+  `panda_slim.xml`. Asset fetching rewrites the latter but not the custom model.
+- Straight capsule finger: from local Z=0.020 to 0.140 m (**120 mm**),
+  tip sphere and `slim_tip_mid` at 0.146 m. Original segment was 60 mm.
+- Box dimensions are **0.32 x 0.32 x 0.05 m** (XY footprint x height).
+  The XML `geom size` stores half-extents: `0.160 0.160 0.025`.
+  This is explicitly a flat box, *not* a 32 cm cube; for a cube set the third
+  half-extent to `0.160`, relocate the initial box/goal centers to z=0.505,
+  and verify robot clearance before simulating.
+- Box mass and table position are unchanged.
 
-- `--route square` (default): **A -> B -> C -> D -> A**, then repeat.
-- `--route pingpong`: **A -> B -> C -> D -> C -> B -> A**, then repeat in the same order (reverses direction at D).
-- `--route point`: legacy one-way **A -> B**, stop when B is reached.
+## Default route: first two waypoints, back and forth
 
-`--cycles 2` (default) completes two traversals. `--cycles 0` keeps repeating, up to the configured `--steps` bound; in that case `completed=false` means the continuous run stopped at its step limit, and `cycles_completed` gives the number of full traversals reached. `--goal-tolerance 0.025` m and `--hold-seconds 1.0` are the unchanged arrival thresholds.
+The default pushing route uses only the first two tabletop points:
 
-You can explicitly specify any four tabletop points in visitation order using `--waypoints AX AY BX BY CX CY DX DY`. When provided, this overrides `--start-xy` and `--goal-xy`; the points need not be an exact square. Each point must keep the full box footprint on the table. The final edge D -> A must be nonzero.
+- **A = (0.40, 0.00) m** (`--start-xy`)
+- **B = (0.40, 0.18) m** (`--goal-xy`)
 
-## Cost (unchanged: exactly three terms)
+It performs **4 full A -> B -> A cycles** (8 arrivals), instead of the
+former 2 square cycles. A waypoint counts as reached after the box remains
+within `--goal-tolerance` for `--hold-seconds`, as before. The box begins at A,
+so B is the first target. If the run reaches `--steps` before all four cycles,
+it reports an incomplete route.
 
-For rollout horizon `H`, action `u_t`, nominal command `u_nom,t`, per-actuator control scales `s_j`, and **the current active keypoint** `g`:
-
+```bash
+python -m manipulation.franka_pushing.run --sampling spike
 ```
-J = (1/H) * sum_t [
-       w_tip  * distance(tip(t), surface(box(t)))
-     + w_goal * || center(box(t)) - g ||_2
-     + w_u    * mean_j( ((u_t,j - u_nom,t,j) / s_j)^2 )
-]
+
+To specify other endpoints use `--start-xy X Y --goal-xy X Y`.
+The old routes remain available via `--route square`, `--route pingpong`,
+and `--route point` (one-way A to B). You can override the repetition
+count with `--cycles N`.
+
+## Cost function (native and Python reference)
+
+```text
+J = mean_t(10.0 * ||box_center(t) - goal_center(t)||
+           + 0.1 * tip_to_nearest_box_surface_distance(t))
 ```
 
-Defaults: `w_tip = 1`, `w_goal = 1`, `w_u = 1e-4`. No intermediate-waypoint lookahead, cumulative path cost, orientation, progress, terminal, velocity, contact, lift, tip-speed, acceleration, or other shaping terms. Simulated physical contacts, friction, and actuator limits are unchanged. MPPI plans toward only **one waypoint at a time**; once reached, the goal is retargeted outside the rollout.
+Default `--control-deviation-weight 0` (optional regularizer disabled).
+Other MPPI cost terms in mode 4 are disabled. The target remains the selected
+waypoint, and the preferred approach side is **not** constrained.
+Change the weights with `--box-goal-weight` and `--tip-box-weight`.
 
-**No covariance reduction near any corner:** `adaptive_noise=False` and `noise_min_fraction=1.0` keep the sampling multiplier fixed at `1.0` for every sampler and waypoint, as in the original point-pushing task.
-
-The two distance terms are motivated by section II-H of the attached *Motoneuron-Inspired Sampling for Model Predictive Path Integral Control* paper (page 7); the paper does not prescribe this exact Cartesian objective.
-
-## Running
-
-From the directory containing `manipulation/`:
+Changing the scene XML requires restarting the simulation only. Changing
+`native/fused_mujoco.cpp` requires rebuilding the C++ extension:
 
 ```bash
 python manipulation/setup_native.py build_ext --inplace
-python -m manipulation.franka_pushing.run --sampling spike --noise-space effector --viewer --verbose
 ```
 
-The rebuilt native extension supports pushing mode 4 (`point_push_abi=1`). If it is unavailable, `--allow-python-rollout` allows slower scalar development/debugging. The original reaching code remains unchanged.
+Default timing remains 100 Hz control, 5 ms MuJoCo physics, 2 substeps, and
+`implicit` integration. A large 32 cm object may require replanning the
+route or robot starting pose to avoid undesired initial contacts.
 
-Run continuously around the square until the step limit:
+## Ball task compatibility
+
+This archive also contains `franka_ball_bouncing/` and
+`franka_ball_balancing/` as thin entry-point aliases for the original
+`franka_bouncing/` and `franka_balancing/` implementations. Both command
+forms run the same controller and cost functions.
+
+## Reversing direction around the 32 cm box
+
+A 20-step, 100 Hz MPPI horizon lasts only 0.2 s. Reversing the box direction
+requires moving the fingertip across roughly 40 cm to the *opposite* side.
+The requested pushing cost (10 x box-goal + 0.1 x tip-box distance) does
+not reward disengaging from the previous contact and taking this long detour.
+
+On each `backforth` target switch, a **separate, deterministic** three-stage
+Cartesian Jacobian-IK transition is enabled by default:
+
+1. Lift the finger above the box top by 12 cm.
+2. Cross over it toward a point 4.5 cm behind the new side face.
+3. Lower to the side face's center height; resume MPPI pushing.
+
+This is deliberately not an MPPI rollout: it is the *same* transition behavior
+for every noise sampler. Reposition steps are labelled `control_phase` in the
+recording and excluded from average MPPI computation time. The box-goal and
+tip-box cost weights during pushing are unchanged. The episode limit is now
+80 simulated seconds (`--steps 8000`) to accommodate four round trips.
 
 ```bash
-python -m manipulation.franka_pushing.run --route square --cycles 0 --steps 10000 --viewer
+python -m manipulation.franka_pushing.run --sampling spike --verbose
+python -m manipulation.franka_pushing.run --sampling spike --no-reposition  # pure MPPI baseline
 ```
 
-Reverse direction at each end of the four-point path:
+Configurable: `--reposition-clearance 0.12`, `--reposition-standoff 0.045`,
+`--reposition-timeout 9`. A failed IK transfer **stops** rather than allowing
+a push from the wrong side. It may still fail if the side is outside the arm's
+workspace or a link collides: check the MuJoCo viewer. No claim of a
+collision-free, model-validated IK transfer is made.
 
-```bash
-python -m manipulation.franka_pushing.run --route pingpong --cycles 2 --viewer
-```
-
-Change the size/location or supply four explicit waypoints:
-
-```bash
-python -m manipulation.franka_pushing.run \
-    --start-xy 0.53 -0.08 --goal-xy 0.53 0.07 --route square --cycles 2
-python -m manipulation.franka_pushing.run \
-    --waypoints 0.48 -0.10 0.48 0.10 0.64 0.10 0.64 -0.10 --route pingpong
-```
-
-Use `--route point` to restore the original A-to-B scenario:
-
-```bash
-python -m manipulation.franka_pushing.run --route point --start-xy 0.55 0 --goal-xy 0.55 0.18
-```
-
-## Retargeting and replay
-
-On each validated arrival, `robot.set_goal_xy()` moves the non-colliding goal marker, the controller reloads the **fused native MuJoCo model** with the updated goal, and any persistent `mj_rollout` mocap data are synchronized. The MPPI warm-start plan is reset at this discontinuous task change, avoiding reuse of commands intended for the previous direction. The physical box and simulation clock continue uninterrupted.
-
-Every replay-compatible NPZ includes `qpos`, `qvel`, `act`, `state_time`, `controls`, `waypoints_xy`, `goal_xyz_history`, `goal_waypoint_index_history`, and the per-corner arrival times/indices. Replay and video export reconstruct the **changing goal marker**, not just the box motion. `--analysis-trace` additionally saves tip/box/joint trajectories and MPPI diagnostics.
-
-```bash
-python -m manipulation.experiments.replay --file manipulation/results/pushing_last_run.npz
-python -m manipulation.experiments.replay --file manipulation/results/pushing_last_run.npz \
-    --mp4 manipulation/results/pushing_last_run.mp4
-```
-
-Repeated trials:
-
-```bash
-python -m manipulation.franka_pushing.batch --sampling spike --repeats 100 \
-    --output-dir manipulation/results/pushing_batch
-```
-
-`summary.csv` includes completed traversals, reached waypoints, success, active-goal box error, control smoothness, and computation time. The underlying objective never changes between legs; only the active goal position is updated.
+For sampler-comparison experiments, disclose the deterministic supervisor and
+report MPPI-only and full-episode performance separately.

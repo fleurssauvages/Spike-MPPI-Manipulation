@@ -45,7 +45,7 @@ class FrankaPushRobot(FrankaReachRobot):
             auto_fetch=False,
             motion_limit_scale=motion_limit_scale,
             acceleration_limit_scale=acceleration_limit_scale,
-            target_xyz=(float(start[0]), float(start[1]), 0.385),
+            target_xyz=(float(start[0]), float(start[1]), 0.370),
         )
         self._table_geom_id = self._geom_id("table")
         self._table_body_id = int(self.model.geom_bodyid[self._table_geom_id])
@@ -192,8 +192,30 @@ class FrankaPushRobot(FrankaReachRobot):
         half = np.asarray(self.model.geom_size[self.task_geom_id], dtype=np.float64)
         return float(np.linalg.norm(np.maximum(np.abs(local) - half, 0.0)))
 
-    def tip_push_face_distance(self, _direction_xy, data=None) -> float:
-        return self.tip_box_surface_distance(data)
+    def tip_push_face_distance(self, direction_xy, data=None) -> float:
+        """Tip distance to the side face opposite the desired XY push direction."""
+        d = self.data if data is None else data
+        direction = np.asarray(direction_xy, dtype=np.float64).reshape(2)
+        magnitude = float(np.linalg.norm(direction))
+        if magnitude <= 1e-12:
+            return self.tip_box_surface_distance(d)
+        direction /= magnitude
+        center = np.asarray(d.geom_xpos[self.task_geom_id], dtype=np.float64)
+        rotation = np.asarray(d.geom_xmat[self.task_geom_id], dtype=np.float64).reshape(3, 3)
+        local = rotation.T @ (self.tip_xyz(d) - center)
+        half = np.asarray(self.model.geom_size[self.task_geom_id], dtype=np.float64)
+        best_alignment = -np.inf
+        best_distance = np.inf
+        for axis in (0, 1):
+            for sign in (-1.0, 1.0):
+                alignment = float(np.dot(-sign * rotation[:2, axis], direction))
+                if alignment <= best_alignment:
+                    continue
+                closest = np.clip(local, -half, half)
+                closest[axis] = sign * half[axis]
+                best_alignment = alignment
+                best_distance = float(np.linalg.norm(local - closest))
+        return best_distance
 
     def tip_target_distance(self, data=None) -> float:
         return self.tip_box_surface_distance(data)

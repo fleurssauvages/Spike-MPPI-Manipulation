@@ -1,4 +1,4 @@
-"""Four tabletop box waypoints and an arrival-triggered square traversal."""
+"""Arrival-triggered two-point, square, and four-point pingpong routes."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,8 +6,8 @@ from dataclasses import dataclass
 import numpy as np
 
 
-DEFAULT_START_XY = (0.50, 0.0)
-DEFAULT_GOAL_XY = (0.50, 0.18)
+DEFAULT_START_XY = (0.40, 0.0)
+DEFAULT_GOAL_XY = (0.40, 0.18)
 
 
 def square_corners(start_xy, second_xy) -> np.ndarray:
@@ -27,16 +27,18 @@ def square_corners(start_xy, second_xy) -> np.ndarray:
 
 def resolve_waypoints(*, start_xy, goal_xy, route: str, waypoints=None) -> np.ndarray:
     """Resolve the CLI geometry and validate adjacent goal separation."""
-    if route not in ("square", "pingpong", "point"):
-        raise ValueError("route must be square, pingpong, or point")
+    if route not in ("backforth", "square", "pingpong", "point"):
+        raise ValueError("route must be backforth, square, pingpong, or point")
     if waypoints is not None:
         if route == "point":
-            raise ValueError("--waypoints is only valid with square or pingpong routes")
+            raise ValueError("--waypoints is not valid for the one-way point route")
         xy = np.asarray(waypoints, dtype=np.float64)
         if xy.size != 8:
             raise ValueError("--waypoints requires four XY pairs (8 numbers)")
         xy = xy.reshape(4, 2)
-    elif route == "point":
+        if route == "backforth":
+            xy = xy[:2]  # Ignore C and D if four waypoints were supplied.
+    elif route in ("point", "backforth"):
         xy = np.asarray([start_xy, goal_xy], dtype=np.float64).reshape(2, 2)
     else:
         xy = square_corners(start_xy, goal_xy)
@@ -54,12 +56,13 @@ class WaypointRoute:
     """Advance the active MPPI goal only after a box-position dwell at it.
 
     Routes start with the physical box at waypoint A (index 0) and target B
-    (index 1). A completed square is A->B->C->D->A. Pingpong is
+    (index 1). Backforth is A->B->A; a full cycle visits B and returns to A.
+    A completed square is A->B->C->D->A. Four-point pingpong is
     A->B->C->D->C->B->A. No target changes happen within an MPPI rollout.
     """
 
-    mode: str = "square"
-    cycles: int = 2
+    mode: str = "backforth"
+    cycles: int = 4
     active_segment: int = 0
     segments_completed: int = 0
     cycles_completed: int = 0
@@ -67,7 +70,9 @@ class WaypointRoute:
     done: bool = False
 
     def __post_init__(self):
-        if self.mode == "square":
+        if self.mode == "backforth":
+            self._sequence = (1, 0)
+        elif self.mode == "square":
             self._sequence = (1, 2, 3, 0)
         elif self.mode == "pingpong":
             self._sequence = (1, 2, 3, 2, 1, 0)
