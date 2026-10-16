@@ -528,7 +528,11 @@ class JointMPPIController:
             self.rollout_batcher = NativeRolloutBatcher(
                 robot, workers=cfg.rollout_workers,
                 batch_hint=max(cfg.num_rollouts, cfg.screen_pool_size if self._screen_enabled else cfg.num_rollouts),
-                chunk_size=cfg.rollout_chunk_size, fused=True,
+                chunk_size=cfg.rollout_chunk_size,
+                # Ball tasks supply a contact-aware Python cost over MuJoCo's
+                # native batched state/sensor trajectories. The existing C++
+                # evaluator does not implement those objectives.
+                fused=not hasattr(robot, "evaluate_ball_rollouts"),
                 screening=self._screen_enabled,
             )
         except Exception:

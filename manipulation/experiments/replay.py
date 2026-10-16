@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 import numpy as np
 
-from manipulation.robots import FrankaReachRobot, FrankaPushRobot
+from manipulation.robots import FrankaReachRobot, FrankaPushRobot, FrankaBallRobot
 
 DEFAULT_REPLAY_LOOKAT = np.asarray([0.48, 0.00, 0.53], dtype=np.float64)
 DEFAULT_REPLAY_DISTANCE = 1.30
@@ -44,6 +44,17 @@ def _prepare_replay(path: str | Path, *, auto_fetch: bool = True):
     if robot_name == "franka-reach":
         target = np.asarray(record.get("target_xyz", [0.45, -0.25, 0.50]), dtype=np.float64).reshape(3)
         robot = FrankaReachRobot(auto_fetch=auto_fetch, target_xyz=target)
+    elif robot_name in {"franka-ball-balancing", "franka-ball-bouncing"}:
+        task = robot_name.removeprefix("franka-ball-")
+        offset = np.asarray(record.get("initial_ball_offset_xy", [0.0, 0.0]), dtype=np.float64).reshape(2)
+        velocity = np.asarray(record.get("initial_ball_velocity_xy", [0.0, 0.0]), dtype=np.float64).reshape(2)
+        drop_height = float(np.asarray(record.get("drop_height", 0.23)).reshape(()))
+        robot = FrankaBallRobot(
+            task=task, auto_fetch=auto_fetch,
+            initial_ball_offset_xy=(float(offset[0]), float(offset[1])),
+            initial_ball_velocity_xy=(float(velocity[0]), float(velocity[1])),
+            drop_height=drop_height,
+        )
     elif robot_name == "franka-push":
         start = np.asarray(record.get("start_xyz", [0.55, 0.0, 0.385]), dtype=np.float64).reshape(3)
         goal = np.asarray(record.get("goal_xyz", [0.55, 0.18, 0.385]), dtype=np.float64).reshape(3)

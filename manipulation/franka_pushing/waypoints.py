@@ -6,8 +6,8 @@ from dataclasses import dataclass
 import numpy as np
 
 
-DEFAULT_START_XY = (0.55, 0.0)
-DEFAULT_GOAL_XY = (0.55, 0.18)
+DEFAULT_START_XY = (0.50, 0.0)
+DEFAULT_GOAL_XY = (0.50, 0.18)
 
 
 def square_corners(start_xy, second_xy) -> np.ndarray:

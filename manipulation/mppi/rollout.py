@@ -99,6 +99,7 @@ class NativeRolloutBatcher:
         self._state_scratch = self.mj.MjData(self.model)
         self._state_pack = np.empty(self.nstate, dtype=np.float64)
         self._state_buffers: dict[tuple[int, int], np.ndarray] = {}
+        self._last_rollout_sensors: np.ndarray | None = None
         self._sensor_buffers: dict[tuple[int, int], np.ndarray] = {}
         self._initial_buffers: dict[int, np.ndarray] = {}
         self._expanded_control_buffers: dict[tuple[int, int, int, int], np.ndarray] = {}
@@ -125,7 +126,12 @@ class NativeRolloutBatcher:
         ).reshape(-1)
         self._task_qadr = getattr(robot, "task_qpos_adr", self._root_qadr)
         self._native_vectorized_cost = self._root_qadr is not None and self._task_qadr is not None
-        self.supports_vectorized_cost = self._native_vectorized_cost
+        # Fixed-base Franka has no world free joint: ordinary state-only push
+        # scores need one, but the ball task scorer reads its free ball and
+        # tool frame sensors directly, so it supports the stock native path.
+        self.supports_vectorized_cost = self._native_vectorized_cost or hasattr(
+            robot, "evaluate_ball_rollouts"
+        )
         self._ctrl_scale = np.maximum(robot.control_scale(), 1e-6)
         self._fd_scale = np.maximum(robot.control_scale(fraction=1.0), 1e-6)
         self._ctrl_low, self._ctrl_high = robot.control_bounds()
@@ -440,9 +446,10 @@ class NativeRolloutBatcher:
             }
             if chunk is not None:
                 kwargs['chunk_size'] = chunk
-            state, _ = self.runner.rollout(
+            state, sensors = self.runner.rollout(
                 self._model_batch(nbatch), self.data, initial, ctrl, **kwargs
             )
+            self._last_rollout_sensors = sensors if sensors is not None else sensor_buf
             return state
 
         kwargs = {}
@@ -450,7 +457,8 @@ class NativeRolloutBatcher:
             kwargs['state'] = self._state_buffer(nbatch, nstep)
         if chunk is not None:
             kwargs['chunk_size'] = chunk
-        state, _ = self.runner.rollout(self.model, self.data, initial, ctrl, **kwargs)
+        state, sensors = self.runner.rollout(self.model, self.data, initial, ctrl, **kwargs)
+        self._last_rollout_sensors = sensors
         return state
 
     @staticmethod
@@ -628,6 +636,10 @@ class NativeRolloutBatcher:
                 native_states=boundaries[1:],
             )
 
+        if hasattr(self.robot, "evaluate_ball_rollouts"):
+            clipped = self.robot.limit_rollout_controls(
+                clipped[None, :, :], start_snapshot.ctrl, substeps * self.robot.physics_dt
+            )[0]
         expanded = self._expand_controls(clipped, substeps)
         states = self.rollout_states(start_state[None, :], expanded)
         sampled = states[0, substeps - 1::substeps, :]
@@ -741,6 +753,36 @@ class NativeRolloutBatcher:
         batch = np.ascontiguousarray(control_batch, dtype=np.float64)
         n, h, _ = batch.shape
         substeps = max(1, int(control_substeps))
+
+        if hasattr(self.robot, "evaluate_ball_rollouts"):
+            if self.fused_evaluator is not None:
+                raise RuntimeError("ball costs require stock MuJoCo rollout, not the fused push evaluator")
+            # Match FrankaReachRobot.step_control: the plant rate-limits each
+            # position command. Ignore proposed commands beyond this envelope
+            # during rollout rather than evaluating physically impossible moves.
+            actual = self.robot.limit_rollout_controls(
+                batch, start_snapshot.ctrl, substeps * self.robot.physics_dt
+            )
+            expanded = self._expand_controls(actual, substeps)
+            initial = self.snapshot_to_state(start_snapshot)[None, :]
+            t0 = time.perf_counter()
+            states = self.rollout_states(initial, expanded)
+            self.last_rollout_physics_ms = 1e3 * (time.perf_counter() - t0)
+            t1 = time.perf_counter()
+            sensors = self._last_rollout_sensors
+            if sensors is None or sensors.shape[:2] != states.shape[:2]:
+                raise RuntimeError("MuJoCo batched rollout did not return ball-tool frame sensors")
+            costs, failed = self.robot.evaluate_ball_rollouts(
+                states, sensors, actual, np.asarray(nominal_controls),
+                np.asarray(start_snapshot.ctrl), self._ctrl_scale,
+                substeps=substeps,
+            )
+            # Nominal track geometry is not part of either ball-task objective.
+            positions = self._task_xy_from_state(states[:, substeps - 1::substeps, :]).copy()
+            progress = np.zeros(n, dtype=np.float64)
+            self.last_rollout_cost_ms = 1e3 * (time.perf_counter() - t1)
+            self.last_rollout_fused_ms = 0.0
+            return positions, np.asarray(costs), progress, np.asarray(failed, dtype=bool)
 
         # Initial push potentials are computed from either a free locomotion root
         # or a fixed-base robot body plus local observation point (Franka fingertip).

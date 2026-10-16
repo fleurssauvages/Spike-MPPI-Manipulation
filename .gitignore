@@ -30,3 +30,5 @@ mujoco_env/
 # Build artifacts
 build/
 *.egg-info/
+
+/results
