@@ -64,6 +64,7 @@ class ControllerConfig:
     noise_min_fraction: float = 0.1
     dslow: float = 0.10
     noise_decay_order: float = 1.0
+    adaptive_noise: bool = True  # False preserves proposal covariance at every distance.
     reach_terminal_weight: float = 0.0
     reach_velocity_weight: float = 0.0
     reach_region_weight: float = 0.0
@@ -1527,10 +1528,13 @@ class JointMPPIController:
             )
         # Scale deviations about the nominal *before* IK; all samplers retain
         # their temporal structure, and the exact nominal candidate is preserved.
-        distance = max(0.0, float(self.robot.tip_target_distance(data)))
-        noise_scale = self.cfg.noise_min_fraction + (1.0 - self.cfg.noise_min_fraction) * min(
-            1.0, (distance / self.cfg.dslow) ** self.cfg.noise_decay_order
-        )
+        if self.cfg.adaptive_noise:
+            distance = max(0.0, float(self.robot.tip_target_distance(data)))
+            noise_scale = self.cfg.noise_min_fraction + (1.0 - self.cfg.noise_min_fraction) * min(
+                1.0, (distance / self.cfg.dslow) ** self.cfg.noise_decay_order
+            )
+        else:
+            noise_scale = 1.0
         controls = nominal[None, :, :] + noise_scale * (controls - nominal[None, :, :])
         controls = self._convert_proposals_to_effector_space(controls, nominal, data)
         # Always evaluate the current nominal control sequence as candidate 0.

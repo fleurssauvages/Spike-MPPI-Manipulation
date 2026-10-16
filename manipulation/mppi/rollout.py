@@ -226,6 +226,8 @@ class NativeRolloutBatcher:
                 and int(getattr(self.fused_evaluator, 'table_contact_policy_abi', -1)) == 1
                 and int(getattr(self.fused_evaluator, 'command_limit_abi', -1)) == 2
                 and int(getattr(self.fused_evaluator, 'simple_reward_abi', -1)) == 5
+                and (int(getattr(self.robot, 'fused_task_mode', 0)) != 4
+                     or int(getattr(self.fused_evaluator, 'point_push_abi', -1)) == 1)
             )
             if not abi_ok:
                 self.fused_evaluator = None
@@ -1500,9 +1502,9 @@ def rollout_controls(
 ) -> tuple[np.ndarray, float, float, bool]:
     """Evaluate one control sequence for the current manipulation task.
 
-    For the Franka reach benchmark this reduces to running 3-D tip-to-target
-    distance, optional tool orientation, and a small nominal-command
-    regularizer.
+    Mode 3 is a point-reaching task. Mode 4 is a separate point-to-point box
+    pushing task with only two Cartesian distances and a small nominal-command
+    regularizer; it does not add orientation or contact penalties.
     """
     cfg = cost_cfg or RolloutCostConfig()
     d = robot.new_data(start_snapshot)
@@ -1535,6 +1537,8 @@ def rollout_controls(
     upright_cost = 0.0
     press_error_sq_sum = 0.0
     reaching = int(getattr(robot, "fused_task_mode", 0)) == 3
+    point_pushing = int(getattr(robot, "fused_task_mode", 0)) == 4
+    goal_distance_sum = 0.0
     reach_cost = 0.0
     settle_cost = 0.0
     last_distance = 0.0
@@ -1578,13 +1582,13 @@ def rollout_controls(
         s_new, d2 = track.project(p)
         root_xy = np.asarray(robot.xy(d), dtype=np.float64)
         root_s, root_d2 = track.project(root_xy)
-        if float(d2) > allowed * allowed or float(root_d2) > allowed * allowed:
+        if not point_pushing and (float(d2) > allowed * allowed or float(root_d2) > allowed * allowed):
             return positions, math.inf, cumulative, True
 
         up = robot.root_up(d)
         if robot.has_fallen(d, flipped_threshold=cfg.min_root_up):
             return positions, math.inf, cumulative, True
-        if pushing and (
+        if pushing and not point_pushing and (
             robot.task_height(d) > initial_task_height + cfg.box_max_lift
             or robot.task_up(d) < cfg.box_min_up
         ):
@@ -1602,7 +1606,10 @@ def rollout_controls(
 
         if pushing:
             root_s_prev = float(root_s)
-            if hasattr(robot, "tip_push_face_distance"):
+            if point_pushing:
+                face_distance_sum += float(robot.tip_box_surface_distance(d))
+                goal_distance_sum += float(np.linalg.norm(robot.task_xyz(d) - robot.goal_xyz(d)))
+            elif hasattr(robot, "tip_push_face_distance"):
                 direction = np.asarray(track.tangent(float(s_new)), dtype=np.float64)
                 face_distance_sum += float(robot.tip_push_face_distance(direction, d))
             elif hasattr(robot, "tip_box_surface_distance"):
@@ -1640,6 +1647,12 @@ def rollout_controls(
             command_cost += float(cfg.control_deviation_weight) * float(np.mean(du * du))
 
     inv_h = 1.0 / float(max(1, h))
+    if point_pushing:
+        # Exactly three terms; physical contacts are simulated, not penalized.
+        total = (float(cfg.robot_box_approach_weight) * face_distance_sum * inv_h
+                 + float(cfg.target_error_weight) * goal_distance_sum * inv_h
+                 + command_cost * inv_h)
+        return positions, float(total), cumulative, False
     face_scale = max(float(initial_task_root_distance), 0.02)
     face_cost = 0.0
     if pushing:

@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 import numpy as np
 
-from manipulation.robots import FrankaReachRobot
+from manipulation.robots import FrankaReachRobot, FrankaPushRobot
 
 DEFAULT_REPLAY_LOOKAT = np.asarray([0.48, 0.00, 0.53], dtype=np.float64)
 DEFAULT_REPLAY_DISTANCE = 1.30
@@ -40,10 +40,27 @@ def load_recording(path: str | Path) -> dict[str, np.ndarray | str | float]:
 
 def _prepare_replay(path: str | Path, *, auto_fetch: bool = True):
     record = load_recording(path)
-    if str(record["robot_name"]) != "franka-reach":
-        raise ValueError(f"unsupported replay robot {record['robot_name']!r}; expected 'franka-reach'")
-    target = np.asarray(record.get("target_xyz", [0.45, -0.25, 0.50]), dtype=np.float64).reshape(3)
-    robot = FrankaReachRobot(auto_fetch=auto_fetch, target_xyz=target)
+    robot_name = str(record["robot_name"])
+    if robot_name == "franka-reach":
+        target = np.asarray(record.get("target_xyz", [0.45, -0.25, 0.50]), dtype=np.float64).reshape(3)
+        robot = FrankaReachRobot(auto_fetch=auto_fetch, target_xyz=target)
+    elif robot_name == "franka-push":
+        start = np.asarray(record.get("start_xyz", [0.55, 0.0, 0.385]), dtype=np.float64).reshape(3)
+        goal = np.asarray(record.get("goal_xyz", [0.55, 0.18, 0.385]), dtype=np.float64).reshape(3)
+        goal_history = np.asarray(record.get("goal_xyz_history", [goal]), dtype=np.float64)
+        if goal_history.ndim == 2 and len(goal_history) and goal_history.shape[1] == 3:
+            goal = goal_history[0]
+        robot = FrankaPushRobot(auto_fetch=auto_fetch, start_xy=start[:2], goal_xy=goal[:2])
+        if "waypoints_xy" in record:
+            xy = np.asarray(record["waypoints_xy"], dtype=np.float64)
+            if xy.shape == (4, 2):
+                robot.set_waypoints_xy(xy)
+            elif xy.shape == (2, 2):
+                robot.hide_waypoints()
+        else:
+            robot.hide_waypoints()  # Older point-push recordings had no square sites.
+    else:
+        raise ValueError(f"unsupported replay robot {robot_name!r}")
     qpos = np.asarray(record["qpos"], dtype=np.float64)
     qvel = np.asarray(record["qvel"], dtype=np.float64)
     state_time = np.asarray(record["state_time"], dtype=np.float64).reshape(-1)
@@ -59,6 +76,10 @@ def _prepare_replay(path: str | Path, *, auto_fetch: bool = True):
         raise ValueError(f"recorded act has shape {act.shape}, expected ({len(qpos)}, {robot.model.na})")
     if controls.ndim != 2 or controls.shape[1] != robot.nu:
         raise ValueError(f"recorded controls have shape {controls.shape}, expected (*, {robot.nu})")
+    if "goal_xyz_history" in record:
+        hist = np.asarray(record["goal_xyz_history"])
+        if hist.shape != (len(qpos), 3):
+            raise ValueError(f"goal_xyz_history has shape {hist.shape}, expected ({len(qpos)}, 3)")
     return record, robot, qpos, qvel, state_time, act, controls
 
 
@@ -75,7 +96,14 @@ def _frame_range(state_time: np.ndarray, start_s: float, end_s: float | None) ->
     return relative_time, first, last
 
 
-def _set_recorded_state(robot, qpos, qvel, state_time, act, controls, i: int) -> None:
+def _set_recorded_state(robot, qpos, qvel, state_time, act, controls, i: int,
+                        goal_history: np.ndarray | None = None) -> None:
+    # The active goal changes at each completed corner; replay the saved mocap
+    # target alongside the recorded rigid-body physics state.
+    if goal_history is not None and isinstance(robot, FrankaPushRobot):
+        goal = np.asarray(goal_history[i], dtype=np.float64)
+        if np.linalg.norm(goal - robot.goal_xyz()) > 1e-9:
+            robot.set_goal_xy(goal[:2])
     robot.data.time = float(state_time[i])
     robot.data.qpos[:] = qpos[i]
     robot.data.qvel[:] = qvel[i]
@@ -120,6 +148,7 @@ def export_video(
         raise ValueError("speed and GIF dimensions must be positive")
     record, robot, qpos, qvel, state_time, act, controls = _prepare_replay(path, auto_fetch=auto_fetch)
     relative_time, first, last = _frame_range(state_time, start_s, end_s)
+    goal_history = record.get("goal_xyz_history")
     control_dt = float(record.get("control_dt", np.nan))
     if not np.isfinite(control_dt) or control_dt <= 0:
         diffs = np.diff(state_time[first:last + 1])
@@ -178,7 +207,7 @@ def export_video(
             )
         with writer:
             for i in indices:
-                _set_recorded_state(robot, qpos, qvel, state_time, act, controls, int(i))
+                _set_recorded_state(robot, qpos, qvel, state_time, act, controls, int(i), goal_history)
                 renderer.update_scene(robot.data, camera=camera, scene_option=scene_option)
                 writer.append_data(np.asarray(renderer.render(), dtype=np.uint8))
     finally:
@@ -221,6 +250,7 @@ def replay(
 ) -> None:
     record, robot, qpos, qvel, state_time, act, controls = _prepare_replay(path, auto_fetch=auto_fetch)
     relative_time, first, last = _frame_range(state_time, start_s, end_s)
+    goal_history = record.get("goal_xyz_history")
     import mujoco.viewer
     viewer = mujoco.viewer.launch_passive(
         robot.model, robot.data, show_left_ui=bool(show_ui), show_right_ui=bool(show_ui)
@@ -243,7 +273,7 @@ def replay(
                 wait = wall0 + (float(relative_time[i]) - sim0) / float(speed) - time.perf_counter()
                 if wait > 0:
                     time.sleep(wait)
-                _set_recorded_state(robot, qpos, qvel, state_time, act, controls, i)
+                _set_recorded_state(robot, qpos, qvel, state_time, act, controls, i, goal_history)
                 viewer.sync()
             if not loop:
                 break

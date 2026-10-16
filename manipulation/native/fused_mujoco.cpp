@@ -86,7 +86,7 @@ struct Job {
   double preferred_box_speed = 0.05;
   double terminal_velocity_weight = 0.0;
   int task_dadr = -1;
-  int task_mode = 1;  // 1=push-face distance, 2=3-D point target
+  int task_mode = 1;  // 1=push-face, 2=button, 3=reach point, 4=box point push
   double reach_terminal_weight = 0;
   double reach_velocity_weight = 0;
   double reach_region_weight = 0;
@@ -434,6 +434,7 @@ class FusedRolloutEvaluator {
     // Button-task metadata.  The proxy free body identifies which button is
     // active by XY, while the actual distance target follows that button's
     // moving top site.  Press depth is read from the real slide joint.
+    point_push_goal_site_id_ = mj_name2id(model_, mjOBJ_SITE, "push_goal_site");
     button_site_ids_[0] = mj_name2id(model_, mjOBJ_SITE, "button_a_top");
     button_site_ids_[1] = mj_name2id(model_, mjOBJ_SITE, "button_b_top");
     const int button_joint_ids[2] = {
@@ -1431,9 +1432,9 @@ class FusedRolloutEvaluator {
   }
 
   void EvaluateOne(const Job& j, int i, mjData* d) const {
-    // Minimal Franka button objective: distance to the active button's moving
-    // top-contact point, actual press-depth error, downward-facing orientation,
-    // and a small nominal-command regularizer.
+    // Shared simulator for the existing tasks plus Franka box point-pushing.
+    // Task mode 4 uses only tool-box surface, box-goal and control-deviation
+    // distances; all other costs remain unchanged for earlier task modes.
     mj_setState(model_, d, j.initial_state, mjSTATE_FULLPHYSICS);
     for (int k = 0; k < j.nu; ++k) {
       d->ctrl[k] = static_cast<mjtNum>(
@@ -1454,6 +1455,7 @@ class FusedRolloutEvaluator {
     double prefix_sum = 0.0;
     double root_prefix_sum = 0.0;
     double face_distance_sum = 0.0;
+    double point_push_goal_distance_sum = 0.0;
     double reach_cost = 0.0;
     double settle_cost = 0.0;
     double last_distance = 0.0;
@@ -1556,7 +1558,7 @@ class FusedRolloutEvaluator {
         ProjectTrack(j, root_x, root_y, &root_s, &root_d2);
       }
 
-      if (j.task_qadr != j.root_qadr) {
+      if (j.task_qadr != j.root_qadr && j.task_mode != 4) {
         const double task_z = d->qpos[j.task_qadr + 2];
         const double task_qx = d->qpos[j.task_qadr + 4];
         const double task_qy = d->qpos[j.task_qadr + 5];
@@ -1572,7 +1574,7 @@ class FusedRolloutEvaluator {
       }
 
       const bool fell = j.root_qadr >= 0 && (up < j.min_up) && TorsoTouchingGround(d);
-      if (best_d2 > j.allowed_sq || root_d2 > j.allowed_sq ||
+      if ((j.task_mode != 4 && (best_d2 > j.allowed_sq || root_d2 > j.allowed_sq)) ||
           fell || d->time <= prev_time + 1e-15) {
         failed = true;
         break;
@@ -1608,6 +1610,19 @@ class FusedRolloutEvaluator {
           const double press_depth = std::max(0.0, -static_cast<double>(d->qpos[button_qadr_[active_button]]));
           const double press_err = std::max(0.0, desired_press - press_depth) / desired_press;
           press_error_sq_sum += press_err * press_err;
+        } else if (j.task_mode == 4) {
+          // Point-to-point box pushing: no orientation, progress, contact or lift
+          // penalties. The approach term is tip-to-box *surface* distance.
+          if (point_push_goal_site_id_ < 0) {
+            failed = true;
+            break;
+          }
+          face_distance_sum += TipToTaskBoxSurfaceDistance(d, root_x, root_y, root_z);
+          const mjtNum* goal = d->site_xpos + 3 * point_push_goal_site_id_;
+          const double gx = xw - static_cast<double>(goal[0]);
+          const double gy = yw - static_cast<double>(goal[1]);
+          const double gz = d->qpos[j.task_qadr + 2] - static_cast<double>(goal[2]);
+          point_push_goal_distance_sum += std::sqrt(gx * gx + gy * gy + gz * gz);
         } else if (j.task_mode == 3) {
           // Clean Franka benchmark: direct 3-D distance from the controlled
           // fingertip point to a fixed free-body target.  No object/contact
@@ -1711,7 +1726,15 @@ class FusedRolloutEvaluator {
         reach_cost = reach_cost * inv_h + j.reach_settle_weight * settle_cost / settle_count
                      + j.reach_terminal_weight * last_distance / face_scale;
       }
-      j.costs[i] = face_cost + press_cost + orientation_cost + contact_cost + table_cost + lift_cost + control_cost + reach_cost + j.reach_acceleration_weight * acceleration_cost * inv_h;
+      if (j.task_mode == 4) {
+        // Three-term objective only: both distances averaged over the horizon
+        // plus the same tiny nominal command regularizer. No extra shaping.
+        j.costs[i] = j.robot_box_approach_weight * face_distance_sum * inv_h
+                     + j.target_error_weight * point_push_goal_distance_sum * inv_h
+                     + control_cost * inv_h;
+      } else {
+        j.costs[i] = face_cost + press_cost + orientation_cost + contact_cost + table_cost + lift_cost + control_cost + reach_cost + j.reach_acceleration_weight * acceleration_cost * inv_h;
+      }
     }
   }
 
@@ -1746,6 +1769,7 @@ class FusedRolloutEvaluator {
   std::vector<unsigned char> finger_body_mask_;
   double tip_region_z_min_ = 0.0;
   int task_dadr_ = -1;
+  int point_push_goal_site_id_ = -1;
   int button_site_ids_[2] = {-1, -1};
   int button_qadr_[2] = {-1, -1};
   double button_tip_radius_ = 0.006;
@@ -1837,5 +1861,6 @@ PYBIND11_MODULE(_fused_mujoco, m) {
       .def_property_readonly("box_contact_policy_abi", [](const FusedRolloutEvaluator&) { return 6; })
       .def_property_readonly("table_contact_policy_abi", [](const FusedRolloutEvaluator&) { return 1; })
       .def_property_readonly("command_limit_abi", [](const FusedRolloutEvaluator&) { return 2; })
-      .def_property_readonly("simple_reward_abi", [](const FusedRolloutEvaluator&) { return 5; });
+      .def_property_readonly("simple_reward_abi", [](const FusedRolloutEvaluator&) { return 5; })
+      .def_property_readonly("point_push_abi", [](const FusedRolloutEvaluator&) { return 1; });
 }

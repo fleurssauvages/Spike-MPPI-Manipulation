@@ -10,27 +10,51 @@ Detailed code and install for a locomotion task and Ant robot is available at: h
 
 ## Demo
 
-<p align="center">
-  <strong>Spike-MPPI (32 rollouts)</strong>
-</p>
+<h3 align="center">Franka Reaching</h3>
 
-<p align="center">
-  <img src="manipulation/results/spike_reaching.gif"
-       width="800"
-       alt="Spike-MPPI reaching">
-</p>
+<table align="center" width="100%">
+  <tr>
+    <th width="50%">Spike-MPPI (32 rollouts)</th>
+    <th width="50%">Standard MPPI (32 rollouts)</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="manipulation/results/spike_reaching.gif"
+           width="100%"
+           alt="Spike-MPPI reaching">
+    </td>
+    <td align="center">
+      <img src="manipulation/results/standard_reaching.gif"
+           width="100%"
+           alt="Standard MPPI reaching">
+    </td>
+  </tr>
+</table>
 
-<p align="center">
-  <strong>Standard MPPI (32 rollouts)</strong>
-</p>
+<br>
 
-<p align="center">
-  <img src="manipulation/results/standard_reaching.gif"
-       width="800"
-       alt="Standard MPPI reaching">
-</p>
+<h3 align="center">Franka Pushing</h3>
 
-## Results on 100 runs
+<table align="center" width="100%">
+  <tr>
+    <th width="50%">Spike-MPPI (32 rollouts)</th>
+    <th width="50%">Standard MPPI (32 rollouts)</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="manipulation/results/spike_pushing.gif"
+           width="100%"
+           alt="Spike-MPPI pushing">
+    </td>
+    <td align="center">
+      <img src="manipulation/results/standard_pushing.gif"
+           width="100%"
+           alt="Standard MPPI pushing">
+    </td>
+  </tr>
+</table>
+
+## Results on 100 reaching runs
 
 <h3 align="center">Normalized Reaching Progress</h3>
 

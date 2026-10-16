@@ -23,12 +23,18 @@
     <geom name="floor" type="plane" size="2 2 0.05" material="reach_ground"
           friction="1 0.01 0.001"/>
 
-    <!-- Five visual-only benchmark waypoints. -->
-    <site name="reach_waypoint_1" type="sphere" pos="0.45 -0.25 0.50" size="0.010" rgba="0.25 0.65 1.0 0.32"/>
-    <site name="reach_waypoint_2" type="sphere" pos="0.50 -0.12 0.62" size="0.010" rgba="0.25 0.65 1.0 0.32"/>
-    <site name="reach_waypoint_3" type="sphere" pos="0.55 0.00 0.50" size="0.010" rgba="0.25 0.65 1.0 0.32"/>
-    <site name="reach_waypoint_4" type="sphere" pos="0.50 0.12 0.62" size="0.010" rgba="0.25 0.65 1.0 0.32"/>
-    <site name="reach_waypoint_5" type="sphere" pos="0.45 0.25 0.50" size="0.010" rgba="0.25 0.65 1.0 0.32"/>
+    <!-- Start keypoint: the physical box is initialized on this point. -->
+    <site name="push_start_keypoint" type="sphere" pos="0.55 0.00 0.385"
+          size="0.007" rgba="1.0 0.55 0.17 0.55"/>
+
+    <!-- Non-colliding visual indicators of the three other square corners.
+         The active green ghost box still marks the current MPPI target. -->
+    <site name="push_waypoint_1" type="sphere" pos="0.55 0.18 0.385"
+          size="0.009" rgba="0.40 0.70 1.00 0.85"/>
+    <site name="push_waypoint_2" type="sphere" pos="0.73 0.18 0.385"
+          size="0.009" rgba="0.40 0.70 1.00 0.85"/>
+    <site name="push_waypoint_3" type="sphere" pos="0.73 0.00 0.385"
+          size="0.009" rgba="0.40 0.70 1.00 0.85"/>
 
     <geom name="table" type="box" pos="0.55 0 0.32" size="0.38 0.42 0.025" rgba="0.37 0.39 0.42 1" friction="0.9 0.02 0.002"/>
     <body name="reach_target" pos="0.55 0 0.385">
@@ -36,6 +42,7 @@
       <geom name="reach_target_geom" type="box" size="0.032 0.032 0.040" mass="0.13" rgba="0.95 0.50 0.18 1" friction="0.8 0.015 0.002"/>
     </body>
     <body name="push_goal" mocap="true" pos="0.55 0.18 0.385">
+      <site name="push_goal_site" pos="0 0 0" size="0.005" rgba="0.16 0.90 0.28 0.7"/>
       <geom name="push_goal_geom" type="box" size="0.032 0.032 0.040" rgba="0.16 0.90 0.28 0.32" contype="0" conaffinity="0"/>
     </body>
   </worldbody>
