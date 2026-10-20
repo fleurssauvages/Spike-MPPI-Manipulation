@@ -541,7 +541,7 @@ def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Franka MPPI five-target free-space reaching benchmark")
     p.add_argument(
         "--sampling",
-        choices=["standard", "poisson", "spike", "gaussian-poisson", "gaussian-spike"],
+        choices=[a.value for a in SamplingOption],
         default="spike",
     )
     p.add_argument("--seed", type=int, default=1)
@@ -591,7 +591,7 @@ def make_parser() -> argparse.ArgumentParser:
         "--cycles", type=int, default=1,
         help="number of complete 1-2-3-4-5-4-3-2-1 sweeps",
     )
-    p.add_argument("--steps", type=int, default=4000)
+    p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--viewer", dest="viewer", action="store_true", default=True)
     p.add_argument("--no-viewer", dest="viewer", action="store_false")
     p.add_argument("--viewer-ui", action="store_true", help="show MuJoCo side panels")

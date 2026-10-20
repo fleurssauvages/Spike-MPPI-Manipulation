@@ -18,6 +18,7 @@ from .rollout import (
 )
 from .fast_kernels import NUMBA_AVAILABLE, lbps_optimize_fast
 from .standard_kernels import standard_gaussian_numba, resolve_standard_sampler
+from .pink_noise import sample_pink_noise
 from .poisson_kernels import StaticPoissonSampler, resolve_poisson_sampler
 from .spike_motor_pool import SpikeMotorPoolSampler, resolve_spike_sampler
 from .spectrum_matched import (
@@ -34,6 +35,7 @@ class SamplingOption(str, Enum):
     """Candidate-generation strategy used by the MPPI controller."""
 
     STANDARD = "standard"
+    PINK = "pink"
     GUIDED = "guided"
     DIAG_LOWRANK = "diag-lowrank"
     SPLINE = "spline"
@@ -331,6 +333,7 @@ class JointMPPIController:
         screen_requested = cfg.screen_pool_size > 0 and cfg.screen_exploit > 0
         screenable = {
             SamplingOption.STANDARD,
+            SamplingOption.PINK,
             SamplingOption.GAUSSIAN_POISSON,
             SamplingOption.POISSON,
             SamplingOption.GAUSSIAN_SPIKE,
@@ -342,7 +345,7 @@ class JointMPPIController:
         )
         if screen_requested and self.sampling not in screenable:
             raise ValueError(
-                "--screen-pool/--screen-exploit are only valid with --sampling standard, "
+                "--screen-pool/--screen-exploit are only valid with --sampling standard, pink, "
                 "gaussian-poisson, poisson, gaussian-spike, or spike"
             )
         self.rng = np.random.default_rng(int(seed))
@@ -746,6 +749,12 @@ class JointMPPIController:
                 f"motor_units={self.cfg.recruitment_levels}/pool, min_rate={self.cfg.base_rate_hz:g}Hz, "
                 f"max_rate={pool.max_rate_hz:g}Hz, scale={self.cfg.proposal_scale_mode}, implementation={self._spike_sampler_backend}"
             )
+        if self.sampling == SamplingOption.PINK:
+            screening = (
+                f"; screening pool={self.cfg.screen_pool_size}"
+                if self._screen_enabled else ""
+            )
+            return "pink Gaussian MPPI sampling: 1/f temporal power, independent channels, unit marginal variance; runtime=numpy-fft" + screening
         if self.sampling == SamplingOption.STANDARD and self._screen_enabled:
             return (
                 "standard MPPI Gaussian sampling with full-horizon screening: "
@@ -757,6 +766,8 @@ class JointMPPIController:
 
     @property
     def sampling_backend_name(self) -> str:
+        if self.sampling == SamplingOption.PINK:
+            return "numpy-fft"
         if self.sampling == SamplingOption.STANDARD:
             return self._standard_sampler_backend
         if self.sampling in {SamplingOption.GAUSSIAN_POISSON, SamplingOption.GAUSSIAN_SPIKE}:
@@ -963,6 +974,15 @@ class JointMPPIController:
             np.add(nominal[None, :, :], noise, out=controls)
             np.clip(controls, self._ctrl_low, self._ctrl_high, out=controls)
         return controls
+
+    def _sample_pink(self, nominal: np.ndarray, count: int | None = None) -> np.ndarray:
+        """Draw 1/f Gaussian perturbations with standard joint-noise scaling."""
+        n = self.cfg.num_rollouts if count is None else max(1, int(count))
+        noise = sample_pink_noise(self.rng, (n, self.cfg.horizon, self.robot.nu))
+        noise *= self._joint_std[None, None, :]
+        noise += nominal[None, :, :]
+        np.clip(noise, self._ctrl_low, self._ctrl_high, out=noise)
+        return noise
 
     @staticmethod
     def _make_bspline_basis(horizon: int, modes: int, degree: int = 3) -> np.ndarray:
@@ -1524,6 +1544,11 @@ class JointMPPIController:
             controls = self._sample_poisson(nominal)
         elif self.sampling == SamplingOption.SPIKE:
             controls = self._sample_spike(nominal)
+        elif self.sampling == SamplingOption.PINK:
+            controls = self._sample_pink(
+                nominal,
+                count=self.cfg.screen_pool_size if self._screen_enabled else None,
+            )
         else:
             controls = self._sample_standard(
                 nominal,

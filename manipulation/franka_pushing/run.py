@@ -449,7 +449,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
 
 def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Franka MPPI: push a box along a two- or four-point route")
-    p.add_argument("--sampling", choices=["standard", "poisson", "spike", "gaussian-poisson", "gaussian-spike"], default="spike")
+    p.add_argument("--sampling", choices=[a.value for a in SamplingOption], default="spike")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--horizon", type=int, default=20)
     p.add_argument("--rollouts", type=int, default=32)

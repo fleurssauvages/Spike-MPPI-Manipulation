@@ -330,7 +330,7 @@ def batch_main() -> None:
     p = make_parser()
     p.description = f"Multi-seed, multi-sampler Franka ball-{task} comparison"
     p.add_argument("--samplers", nargs="+", choices=[a.value for a in SamplingOption],
-                   default=["standard", "gaussian-spike", "spike", "poisson"])
+                   default=["standard", "pink", "gaussian-spike", "spike", "poisson"])
     p.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
     p.add_argument("--csv", type=str, default=f"results/franka_ball_{task}/summary.csv")
     p.set_defaults(viewer=False)
