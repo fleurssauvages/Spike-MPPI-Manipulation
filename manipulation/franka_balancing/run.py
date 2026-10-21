@@ -34,7 +34,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--steps", type=int, default=2000 if task == "balancing" else 800)
     p.add_argument("--horizon", type=int, default=20)
-    p.add_argument("--rollouts", type=int, default=128)
+    p.add_argument("--rollouts", type=int, default=32)
     p.add_argument("--control-dt", type=float, default=0.01)
     p.add_argument("--physics-dt", type=float, default=None,
                    help="Override XML physics timestep (default 0.005 s); "
