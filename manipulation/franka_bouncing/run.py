@@ -337,32 +337,42 @@ def batch_main() -> None:
     p.description = f"Multi-seed, multi-sampler Franka ball-{task} comparison"
     p.add_argument("--samplers", nargs="+", choices=[a.value for a in SamplingOption],
                    default=["standard", "pink", "gaussian-spike", "spike", "poisson"])
-    p.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
-    p.add_argument("--csv", type=str, default=f"results/franka_ball_{task}/summary.csv")
+    p.add_argument("--repeats", type=int, default=100)
+    p.add_argument("--seed-start", type=int, default=None,
+                   help="first seed (defaults to --seed)")
+    p.add_argument("--output-dir", type=str, default=f"results/franka_ball_{task}",
+                   help="Base directory; each sampler writes NPZ files and summary.csv to <output-dir>/<sampler>/")
     p.set_defaults(viewer=False)
     args = p.parse_args()
     # Batch comparisons are headless unless --viewer is explicitly supplied.
     # The default viewer applies only to interactive `run.py`.
     if args.viewer:
         raise ValueError("Batch mode is headless; pass --no-viewer")
-    rows = []
+    if args.repeats < 1:
+        raise ValueError("--repeats must be >= 1")
+    start_seed = args.seed if args.seed_start is None else args.seed_start
+    seeds = range(int(start_seed), int(start_seed) + args.repeats)
+    # Samplers run sequentially; each one gets its own output directory.
     for sampler in args.samplers:
-        for seed in args.seeds:
+        out = Path(args.output_dir).expanduser() / sampler
+        rows = []
+        for i, seed in enumerate(seeds):
             single = argparse.Namespace(**vars(args))
             single.sampling = sampler
             single.seed = int(seed)
             if args.save is None:
-                single.save = f"results/franka_ball_{task}/{sampler}_seed{seed}.npz"
+                single.save = str(out / f"{sampler}_seed{seed}.npz")
             result = run(single)
-            print(json.dumps(result))
+            print(f"[{i+1}/{args.repeats}] seed={seed} success={result['success']} "
+                  f"sim_time={result['duration_s']:.2f}s", flush=True)
             rows.append(result)
-    dest = Path(args.csv).expanduser().resolve()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with dest.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"CSV: {dest}")
+        dest = (out / "summary.csv").resolve()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"CSV: {dest}", flush=True)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ import traceback
 
 import numpy as np
 
+from manipulation.mppi import SamplingOption
+
 from .run import make_parser, run
 
 
@@ -28,7 +30,10 @@ def make_batch_parser() -> argparse.ArgumentParser:
     parser.description = "Independent Franka two-point/square/pingpong pushing trials"
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--seed-start", type=int, default=None)
-    parser.add_argument("--output-dir", default="manipulation/results/pushing_batch")
+    parser.add_argument("--samplers", nargs="+", choices=[a.value for a in SamplingOption], default=None,
+                        help="samplers to run sequentially (defaults to --sampling)")
+    parser.add_argument("--output-dir", default="manipulation/results/pushing_batch",
+                        help="base directory; each sampler writes to <output-dir>/<sampler>/")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
     return parser
@@ -109,12 +114,19 @@ def main() -> None:
     args = make_batch_parser().parse_args()
     if args.repeats < 1:
         raise ValueError("--repeats must be >= 1")
-    out = Path(args.output_dir).expanduser().resolve()
-    out.mkdir(parents=True, exist_ok=True)
     args.viewer = False
     args.analysis_trace = True
     args.no_save = False
     start_seed = args.seed if args.seed_start is None else args.seed_start
+    base = Path(args.output_dir).expanduser().resolve()
+    # Samplers run sequentially; each one gets its own output directory.
+    for sampler in args.samplers or [args.sampling]:
+        args.sampling = sampler
+        run_sampler(args, base / sampler, start_seed)
+
+
+def run_sampler(args: argparse.Namespace, out: Path, start_seed: int) -> None:
+    out.mkdir(parents=True, exist_ok=True)
     config = {k: v for k, v in vars(args).items()
               if isinstance(v, (str, int, float, bool, tuple, list))}
     (out / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
@@ -141,9 +153,7 @@ def main() -> None:
             row["trial"] = i
             records.append(row)
             print(f"[{i+1}/{args.repeats}] seed={seed} success={row['success']} "
-                  f"cycles={row['cycles_completed']} arrivals={row['waypoints_reached']} "
-                  f"error={row['final_box_error_m']:.3f}m "
-                  f"compute_ms={row['mean_compute_ms']:.2f}", flush=True)
+                  f"sim_time={row['duration_s']:.2f}s", flush=True)
         except Exception as exc:
             errors.append({"trial": i, "seed": seed,
                            "error": repr(exc), "traceback": traceback.format_exc()})

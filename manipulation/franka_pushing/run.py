@@ -484,7 +484,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--lbps-delta", type=float, default=0.95)
     p.add_argument("--goal-tolerance", type=float, default=0.025)
     p.add_argument("--hold-seconds", type=float, default=1.0)
-    p.add_argument("--steps", type=int, default=4000)
+    p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--viewer", dest="viewer", action="store_true", default=True)
     p.add_argument("--no-viewer", dest="viewer", action="store_false")
     p.add_argument("--viewer-ui", action="store_true")
