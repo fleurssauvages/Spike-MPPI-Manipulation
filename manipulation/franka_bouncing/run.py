@@ -31,7 +31,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--sampling", choices=[a.value for a in SamplingOption], default="spike")
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--steps", type=int, default=2000 if task == "balancing" else 800)
+    p.add_argument("--steps", type=int, default=2000 if task == "balancing" else 2500)
     p.add_argument("--horizon", type=int, default=100)
     p.add_argument("--rollouts", type=int, default=32)
     p.add_argument("--control-dt", type=float, default=0.01)
@@ -342,6 +342,8 @@ def batch_main() -> None:
                    help="first seed (defaults to --seed)")
     p.add_argument("--output-dir", type=str, default=f"results/franka_ball_{task}",
                    help="Base directory; each sampler writes NPZ files and summary.csv to <output-dir>/<sampler>/")
+    p.add_argument("--resume", action="store_true",
+                   help="skip seeds that already have a summary.csv row and an NPZ recording")
     p.set_defaults(viewer=False)
     args = p.parse_args()
     # Batch comparisons are headless unless --viewer is explicitly supplied.
@@ -355,8 +357,19 @@ def batch_main() -> None:
     # Samplers run sequentially; each one gets its own output directory.
     for sampler in args.samplers:
         out = Path(args.output_dir).expanduser() / sampler
-        rows = []
+        dest = (out / "summary.csv").resolve()
+        # Rows keyed by seed. On resume, a seed counts as done only if its CSV
+        # row exists and its recording is still on disk; anything else reruns.
+        rows: dict[int, dict] = {}
+        if args.resume and dest.is_file():
+            with dest.open(newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("recording") and Path(row["recording"]).is_file():
+                        rows[int(row["seed"])] = row
         for i, seed in enumerate(seeds):
+            if seed in rows:
+                print(f"[{i+1}/{args.repeats}] seed={seed}: already done, skipping", flush=True)
+                continue
             single = argparse.Namespace(**vars(args))
             single.sampling = sampler
             single.seed = int(seed)
@@ -365,14 +378,21 @@ def batch_main() -> None:
             result = run(single)
             print(f"[{i+1}/{args.repeats}] seed={seed} success={result['success']} "
                   f"sim_time={result['duration_s']:.2f}s", flush=True)
-            rows.append(result)
-        dest = (out / "summary.csv").resolve()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with dest.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
+            rows[int(seed)] = result
+            _write_summary(dest, [rows[k] for k in sorted(rows)])
         print(f"CSV: {dest}", flush=True)
+
+
+def _write_summary(dest: Path, rows: list[dict]) -> None:
+    """Rewrite the per-sampler CSV after every run, atomically."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(dict.fromkeys(k for row in rows for k in row))
+    temp = dest.with_suffix(".tmp")
+    with temp.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    temp.replace(dest)
 
 
 if __name__ == "__main__":

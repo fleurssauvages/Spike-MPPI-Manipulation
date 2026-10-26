@@ -40,7 +40,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.description = 'FR3 fused-position MPPI at 100 Hz (UDP joint-position commands)'
     p.set_defaults(control_dt=0.01, viewer=False, analysis_trace=True,
                    save='results/reaching_real/run_seed_1.npz',
-                   steps=30000, motion_limit_scale=0.25, rollouts=32)
+                   steps=30000, motion_limit_scale=0.25, rollouts=32,
+                   actuator_lag_kp=4.0)  # PC1: 1 kHz qdot = 4 (q_des - q)
     p.add_argument('--pc1-ip', default='10.20.0.1')
     p.add_argument('--pc2-ip', default='10.20.0.17')
     p.add_argument('--execute', action='store_true',
@@ -53,6 +54,9 @@ def make_parser() -> argparse.ArgumentParser:
                    help='MPPI computation budget (ms); 100 Hz requires completion in about 10 ms')
     p.add_argument('--max-tick-lateness-ms', type=float, default=8.0,
                    help='abort when high-level schedule lateness exceeds this value')
+    p.add_argument('--command-deadline-ms', type=float, default=30.0,
+                   help='abort if a joint command cannot be sent within this many ms of the '
+                        'feedback sample it was computed from; slower ticks only delay the schedule')
     p.add_argument('--warmup-steps', type=int, default=2,
                    help='preflight MPPI rollouts, to trigger JIT before realtime operation')
     p.add_argument('--home-hold', type=float, default=0.5,
@@ -68,6 +72,9 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--viewer-every', type=int, default=10,
                    help='refresh optional MuJoCo measured-state viewer every N control ticks; visualization can affect control timing')
     p.add_argument('--print-every', type=int, default=50)
+    p.add_argument('--model-ctrl', choices=['last-command', 'measured'], default='last-command',
+                   help='MPPI model ctrl at each tick: the last joint target sent to PC1 '
+                        '(matches the real P-controller setpoint) or the measured joint angles')
     return p
 
 
@@ -87,7 +94,7 @@ def _validate(args) -> None:
     if args.rollouts < 1 or args.horizon < 1:
         raise ValueError('rollouts/horizon must be positive')
     for name in ('joint_limit_margin', 'feedback_timeout',
-                 'max_compute_ms', 'max_tick_lateness_ms', 'goal_tolerance',
+                 'max_compute_ms', 'max_tick_lateness_ms', 'command_deadline_ms', 'goal_tolerance',
                  'hold_seconds', 'dslow',
                  'home_hold', 'home_timeout',
                  'home_settle_joint_speed'):
@@ -100,7 +107,7 @@ def _validate(args) -> None:
 
 
 
-def update_measured_model(robot, sample, *, elapsed, joint_low, joint_high):
+def update_measured_model(robot, sample, *, elapsed, joint_low, joint_high, last_command=None):
     q, dq = sample.q, sample.dq
     if np.any(q < joint_low) or np.any(q > joint_high):
         raise RuntimeError('measured joint is inside safety margin of a position limit')
@@ -108,19 +115,24 @@ def update_measured_model(robot, sample, *, elapsed, joint_low, joint_high):
         raise RuntimeError('non-finite measured joint velocity')
     robot.data.qpos[robot._joint_qadr] = q
     robot.data.qvel[robot._joint_dadr] = dq
-    # The MPPI model is joint-position controlled. Set its nominal ctrl to
-    # the MEASURED joint angles before each optimization, not an old sim ctrl.
-    ctrl = robot.clip_ctrl(q)
-    if np.max(np.abs(ctrl - q)) > 1e-6:
+    if np.max(np.abs(robot.clip_ctrl(q) - q)) > 1e-6:
         raise RuntimeError('measured joints outside MPPI actuator position limits')
-    robot.data.ctrl[:] = ctrl
+    # The MPPI model is joint-position controlled. Its ctrl is the setpoint the
+    # real P controller is currently tracking (the last command sent), so the
+    # model starts with the same kp*(ctrl - q) drive and the rate limiter
+    # continues from that command. Without a sent command, use the measured q.
+    setpoint = q if last_command is None else np.asarray(last_command, dtype=float)
+    if not np.isfinite(setpoint).all():
+        raise RuntimeError('non-finite last joint command')
+    robot.data.ctrl[:] = robot.clip_ctrl(setpoint)
     robot.data.time = float(elapsed)
     robot.mujoco.mj_forward(robot.model, robot.data)
 
 
 
 
-def joint_feedback_with_model_fk(udp, robot, timeout, *, elapsed, joint_low, joint_high):
+def joint_feedback_with_model_fk(udp, robot, timeout, *, elapsed, joint_low, joint_high,
+                                 last_command=None):
     """Return fresh joint feedback and an FK-derived link8-proxy position.
 
     This is NOT an independent Cartesian measurement; any model/base frame
@@ -128,7 +140,8 @@ def joint_feedback_with_model_fk(udp, robot, timeout, *, elapsed, joint_low, joi
     """
     joint = udp.fresh(timeout)
     update_measured_model(robot, joint, elapsed=elapsed,
-                          joint_low=joint_low, joint_high=joint_high)
+                          joint_low=joint_low, joint_high=joint_high,
+                          last_command=last_command)
     xyz = np.asarray(robot.tip_xyz(), dtype=float).copy()
     if not np.isfinite(xyz).all():
         raise RuntimeError('nonfinite link8 model FK from joint feedback')
@@ -244,7 +257,8 @@ def run(args: argparse.Namespace) -> dict:
     robot = FrankaReachRobot(
         auto_fetch=not args.no_auto_fetch,
         motion_limit_scale=float(args.motion_limit_scale),
-        target_xyz=REACH_TARGETS[0])
+        target_xyz=REACH_TARGETS[0],
+        actuator_lag_kp=args.actuator_lag_kp)
     # Reposition the geometry the original fused-position backend uses for its
     # end-effector objective. It now coincides with the slim_gripper BODY ORIGIN,
     # our Panda-model proxy for FR3 link8. No virtual fingertip is used for cost,
@@ -319,6 +333,7 @@ def run(args: argparse.Namespace) -> dict:
     min_error = float('inf')
     previous_cmd = np.zeros(7, dtype=float)
     diagnostics = {name: [] for name in DIAGNOSTIC_NAMES}
+    overrun_ticks = 0
     extra_diag = {name: [] for name in (
         'loop_ms', 'tick_lateness_ms', 'feedback_age_ms',
         'measured_joint_stamp_sec', 'measured_joint_stamp_nsec',
@@ -420,9 +435,12 @@ def run(args: argparse.Namespace) -> dict:
                     homing_final_error = distance_to_home
                     homing_completed = distance_to_home <= args.home_joint_tolerance
                     pass
+                # Setpoint PC1 is tracking; only known when commands are actually sent.
+                track_command = args.execute and args.model_ctrl == 'last-command'
+                last_command = home_q.copy() if track_command else None
                 initial_joint, initial_xyz = joint_feedback_with_model_fk(
                     udp, robot, args.feedback_timeout, elapsed=0.,
-                    joint_low=qlow, joint_high=qhigh)
+                    joint_low=qlow, joint_high=qhigh, last_command=last_command)
                 # The real task is expressed entirely in model FK coordinates,
                 # matching the native fused model's cost and Jacobian endpoint.
                 real_targets = shifted_targets.copy()
@@ -447,7 +465,7 @@ def run(args: argparse.Namespace) -> dict:
                         raise RuntimeError(f'{1.0/args.control_dt:.0f}Hz tick missed: lateness={lateness_ms:.2f} ms')
                     joint, link8_xyz = joint_feedback_with_model_fk(
                         udp, robot, args.feedback_timeout, elapsed=tick_start-start,
-                        joint_low=qlow, joint_high=qhigh)
+                        joint_low=qlow, joint_high=qhigh, last_command=last_command)
                     # The receiver runs independently. A sample can have the same
                     # sequence at adjacent ticks without indicating lost feedback;
                     # freshness is enforced by udp.fresh() using monotonic age.
@@ -471,9 +489,13 @@ def run(args: argparse.Namespace) -> dict:
                     predicted_xyz = _model_body_xyz(robot, q_target, wrist_id)
                     if not np.isfinite(predicted_xyz).all() or predicted_xyz[2] < args.home_min_z:
                         raise RuntimeError('optimized joint target below FK workspace Z minimum')
-                    if time.monotonic() > next_tick + args.control_dt + args.max_tick_lateness_ms/1000.:
-                        raise RuntimeError('joint-position command deadline missed')
+                    command_age_ms = (time.monotonic() - tick_start) * 1e3
+                    if command_age_ms > args.command_deadline_ms:
+                        raise RuntimeError(f'joint-position command deadline missed: '
+                                           f'{command_age_ms:.2f} ms > {args.command_deadline_ms:.1f} ms')
                     udp.send_joint_positions(q_target)
+                    if track_command:
+                        last_command = q_target.copy()
                     desired_delta = predicted_xyz - link8_xyz
                     goal_vector = real_targets[ids[target_ptr]] - link8_xyz
                     delta_progress = float(np.dot(desired_delta, goal_vector) / max(np.linalg.norm(goal_vector), 1e-9))
@@ -555,8 +577,13 @@ def run(args: argparse.Namespace) -> dict:
                     # state row is appended on exit separately.
                     if completed:
                         break
-                    if time.monotonic() > next_tick + args.max_tick_lateness_ms/1000.:
-                        raise RuntimeError(f'{1.0/args.control_dt:.0f}Hz deadline overrun (after command send)')
+                    # A slow tick delays the schedule instead of aborting: PC1 keeps
+                    # tracking the last setpoint, and the command deadline above
+                    # still bounds how stale each sent command can be.
+                    now = time.monotonic()
+                    if now > next_tick + args.max_tick_lateness_ms/1000.:
+                        next_tick = now
+                        overrun_ticks += 1
             except KeyboardInterrupt:
                 stop_reason = 'keyboard_interrupt'
                 stop_detail = 'user requested stop'
@@ -678,6 +705,7 @@ def run(args: argparse.Namespace) -> dict:
                              if experiment_start is not None and experiment_end is not None else float('nan')),
         'sampling':args.sampling, 'rollout_backend':backend,
         'max_loop_ms':float(max(extra_diag['loop_ms'], default=float('nan'))),
+        'overrun_ticks':int(overrun_ticks),
         'max_compute_ms':float(max(diagnostics['timing_total_ms'], default=float('nan'))),
         'min_error_m':float(min_error),
         'homing_completed':homing_completed,

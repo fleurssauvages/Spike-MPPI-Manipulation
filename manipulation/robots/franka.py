@@ -43,6 +43,7 @@ class FrankaReachRobot:
         motion_limit_scale: float = 1.0,
         acceleration_limit_scale: float | None = 1.0,
         target_xyz=(0.45, -0.25, 0.50),
+        actuator_lag_kp: float | None = None,
     ) -> None:
         try:
             import mujoco
@@ -85,6 +86,9 @@ class FrankaReachRobot:
         self._arm_actuator_ids = np.arange(7, dtype=np.int32)
         if int(self.model.nu) != 7:
             raise ValueError(f"slim-tool Panda should expose 7 arm actuators, got {self.model.nu}")
+        self.actuator_lag_kp = None if actuator_lag_kp is None else float(actuator_lag_kp)
+        if self.actuator_lag_kp is not None:
+            self._apply_actuator_lag(self.actuator_lag_kp)
 
         self.motion_limit_scale = float(motion_limit_scale)
         if not np.isfinite(self.motion_limit_scale) or not (0.0 < self.motion_limit_scale <= 1.0):
@@ -115,6 +119,24 @@ class FrankaReachRobot:
         self.reset()
         self.set_target_xyz(self._target_xyz)
         self.initial_root_height = float(self.tip_xyz()[2])
+
+    def _apply_actuator_lag(self, lag_kp: float) -> None:
+        """Make the arm follow ctrl like the real 1 kHz loop qdot = lag_kp * (ctrl - q).
+
+        Gravity is compensated on every arm body (the real velocity loop has no
+        steady-state sag), and each position actuator gets kv = kp / lag_kp. With
+        the stiff Menagerie kp, inertia is negligible and the joint response is
+        first order with time constant 1 / lag_kp. Must run before rollout
+        backends are built, since they copy this in-memory model.
+        """
+        if not np.isfinite(lag_kp) or lag_kp <= 0.0:
+            raise ValueError("actuator_lag_kp must be finite and positive")
+        base = self._body_id("link0")
+        for body in range(int(self.model.nbody)):
+            if body == base or self._is_descendant_body(body, base):
+                self.model.body_gravcomp[body] = 1.0
+        ids = self._arm_actuator_ids
+        self.model.actuator_biasprm[ids, 2] = -self.model.actuator_gainprm[ids, 0] / lag_kp
 
     def _body_id(self, name: str) -> int:
         out = int(self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_BODY, name))

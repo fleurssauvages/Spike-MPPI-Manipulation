@@ -216,6 +216,7 @@ def run(args: argparse.Namespace) -> dict[str, float | int | bool | str]:
         motion_limit_scale=float(args.motion_limit_scale),
         acceleration_limit_scale=1.0,
         target_xyz=target_sequence[0],
+        actuator_lag_kp=args.actuator_lag_kp,
     )
 
     # The generic controller still expects a broad 2-D progress adapter.  The
@@ -572,6 +573,9 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--reach-settle-steps", type=int, default=30)
     p.add_argument("--rollout-workers", type=int, default=8)
     p.add_argument("--motion-limit-scale", type=float, default=1.0)
+    p.add_argument("--actuator-lag-kp", type=float, default=None,
+                   help="model the real 1 kHz joint loop qdot = Kp (q_des - q): arm gravity "
+                        "compensation and kv = kp / Kp (off by default)")
     p.add_argument("--target-distance-weight", type=float, default=1.0)
     p.add_argument("--control-deviation-weight", type=float, default=1e-4)
     p.add_argument(
